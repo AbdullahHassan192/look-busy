@@ -1,11 +1,15 @@
 # Look Busy
 
-Your AI is writing the real code.  
-You are writing... a convincing performance review.
+Tired of watching reels between AI prompts?
 
-**Look Busy** is a VS Code extension for people who need to look intensely productive while Copilot (or your favorite robot coworker) does the heavy lifting.
+**Look Busy** is a VS Code extension for people who want to look or feel intensely productive while their favourite AI coworker does the heavy lifting.
 
-It gives you monkeytype-style typing practice using snippets from your own workspace, so from a distance it looks like you are shipping features at warp speed.
+It gives you monkeytype-style typing practice using snippets from your own code, so from a distance it looks like you are shipping features at warp speed.
+
+![Look Busy demo](media/look-busy-demo.gif)
+![Start from status bar](media/statusbar-start.png)
+![Typing session](media/typing-session.png)
+![Panic exit](media/panic-exit.png)
 
 ## What this masterpiece does
 
@@ -13,9 +17,7 @@ It gives you monkeytype-style typing practice using snippets from your own works
 - Skips leading import/header boilerplate so you are not grinding through `import x from y` forever.
 - Sometimes starts around the middle of longer files, because fake productivity deserves variety.
 - Highlights untyped and mistyped characters as you type.
-- Suppresses suggestion UI to keep the flow uninterrupted.
-- Blocks disruptive edits during the session so chaos stays contained.
-- Includes a panic kill switch: `Esc` (for when your boss spawns behind you to check if you can be replaced by an LLM or not).
+- Includes a panic kill switch: `Esc` (for when your boss spawns behind you to check if you can be replaced by an AI agent or not).
 - Shows your WPM when the session ends, so you can measure how fast you can pretend.
 
 ## How to start looking busy

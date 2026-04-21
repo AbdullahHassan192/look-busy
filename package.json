@@ -1,17 +1,18 @@
 {
   "name": "look-busy",
   "displayName": "Look Busy",
-  "description": "Monkeytype-style coding practice from your workspace while AI writes code",
-  "publisher": "YOUR_PUBLISHER_ID",
+  "description": "Pretend to look busy while AI writes your code",
+  "publisher": "AbdullahHassan",
   "version": "0.0.1",
+  "icon": "media/look-busy-icon.png",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/YOUR_GITHUB_USER/look-busy.git"
+    "url": "https://github.com/AbdullahHassan192/look-busy.git"
   },
-  "homepage": "https://github.com/YOUR_GITHUB_USER/look-busy#readme",
+  "homepage": "https://github.com/AbdullahHassan192/look-busy#readme",
   "bugs": {
-    "url": "https://github.com/YOUR_GITHUB_USER/look-busy/issues"
+    "url": "https://github.com/AbdullahHassan192/look-busy/issues"
   },
   "keywords": [
     "typing",

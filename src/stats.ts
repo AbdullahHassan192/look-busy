@@ -20,8 +20,8 @@ const SNARKY_SLOW = [
 
 const SNARKY_MID = [
 	'Not bad. AI still looks concerned, but less concerned.',
-	'Respectable speed. AI has paused the takeover for now.',
-	'You are keeping up, but AI is still side-eyeing your keyboard.',
+	'Respectable speed. The AI takeover is paused... for now.',
+	'You are coding fast enough to make AI feel a little insecure.',
 ];
 
 const SNARKY_FAST = [

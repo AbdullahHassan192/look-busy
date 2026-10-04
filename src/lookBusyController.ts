@@ -21,7 +21,6 @@ interface BusySession {
 	lastKeystrokeAt?: number;
 	activeElapsedMs: number;
 	totalKeystrokes: number;
-	correctKeystrokes: number;
 	errorKeystrokes: number;
 	backspaceCount: number;
 	tempFilePath: string;
@@ -32,7 +31,6 @@ type SessionExitReason = 'completed' | 'panic' | 'documentClosed' | 'restarted' 
 export class LookBusyController implements vscode.Disposable {
 	private readonly untypedDecoration: vscode.TextEditorDecorationType;
 	private readonly wrongDecoration: vscode.TextEditorDecorationType;
-	private readonly hiddenDecoration: vscode.TextEditorDecorationType;
 	private readonly emptyLineHintDecoration: vscode.TextEditorDecorationType;
 	private readonly eolHintDecoration: vscode.TextEditorDecorationType;
 	private readonly sessionStatusBarItem: vscode.StatusBarItem;
@@ -52,13 +50,6 @@ export class LookBusyController implements vscode.Disposable {
 		this.wrongDecoration = vscode.window.createTextEditorDecorationType({
 			color: new vscode.ThemeColor('editorError.foreground'),
 			textDecoration: 'underline',
-		});
-
-		this.hiddenDecoration = vscode.window.createTextEditorDecorationType({
-			color: new vscode.ThemeColor('editor.background'),
-			backgroundColor: new vscode.ThemeColor('editor.background'),
-			opacity: '0',
-			textDecoration: 'none; text-decoration-color: transparent; border-bottom: none; outline: none;',
 		});
 
 		this.emptyLineHintDecoration = vscode.window.createTextEditorDecorationType({
@@ -83,7 +74,6 @@ export class LookBusyController implements vscode.Disposable {
 		this.disposables.push(
 			this.untypedDecoration,
 			this.wrongDecoration,
-			this.hiddenDecoration,
 			this.emptyLineHintDecoration,
 			this.eolHintDecoration,
 			this.sessionStatusBarItem,
@@ -233,7 +223,6 @@ export class LookBusyController implements vscode.Disposable {
 			tempFilePath,
 			activeElapsedMs: 0,
 			totalKeystrokes: 0,
-			correctKeystrokes: 0,
 			errorKeystrokes: 0,
 			backspaceCount: 0,
 		};
@@ -345,7 +334,6 @@ export class LookBusyController implements vscode.Disposable {
 
 			const expected = this.session.target[this.session.index];
 			if (character === expected) {
-				this.session.correctKeystrokes += 1;
 				this.session.statuses[this.session.index] = 1;
 				this.session.autoFilled[this.session.index] = false;
 				this.session.index += 1;
@@ -355,7 +343,6 @@ export class LookBusyController implements vscode.Disposable {
 
 			const tabEquivalentLength = this.consumeTabEquivalentIndentation(character);
 			if (tabEquivalentLength > 0) {
-				this.session.correctKeystrokes += 1;
 				this.session.statuses[this.session.index] = 1;
 				this.session.autoFilled[this.session.index] = false;
 				for (let i = 1; i < tabEquivalentLength; i += 1) {
@@ -444,10 +431,8 @@ export class LookBusyController implements vscode.Disposable {
 		const window = this.getVisibleWindow();
 		const untypedRanges = this.collectRangesForStatus(0, window.start, window.end);
 		const wrongRanges = this.collectRangesForStatus(2, window.start, window.end);
-		const hiddenRanges = this.collectHiddenRanges(window.start, window.end);
 		this.session.editor.setDecorations(this.untypedDecoration, untypedRanges);
 		this.session.editor.setDecorations(this.wrongDecoration, wrongRanges);
-		this.session.editor.setDecorations(this.hiddenDecoration, hiddenRanges);
 
 		const emptyLineHints: vscode.Range[] = [];
 		const eolHints: vscode.Range[] = [];
@@ -506,10 +491,6 @@ export class LookBusyController implements vscode.Disposable {
 		return ranges;
 	}
 
-	private collectHiddenRanges(visibleStart: number, visibleEnd: number): vscode.Range[] {
-		return [];
-	}
-
 	private applyCursor(): void {
 		if (!this.session) {
 			return;
@@ -548,7 +529,6 @@ export class LookBusyController implements vscode.Disposable {
 
 		previousSession.editor.setDecorations(this.untypedDecoration, []);
 		previousSession.editor.setDecorations(this.wrongDecoration, []);
-		previousSession.editor.setDecorations(this.hiddenDecoration, []);
 		previousSession.editor.setDecorations(this.emptyLineHintDecoration, []);
 		previousSession.editor.setDecorations(this.eolHintDecoration, []);
 

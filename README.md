@@ -8,7 +8,6 @@ It gives you monkeytype-style typing practice using snippets from your own code,
 
 ![Look Busy demo](media/look-busy-demo.gif)
 ![Start from status bar](media/statusbar-start.png)
-![Typing session](media/typing-session.png)
 ![Panic exit](media/panic-exit.png)
 
 ## What this masterpiece does
@@ -28,5 +27,5 @@ It gives you monkeytype-style typing practice using snippets from your own code,
 
 ## Notes
 
-- You need an open workspace.
-- Source material is picked from common code file types (TS/JS/Python/Go/Rust/Java/C/C++/C#/PHP/Ruby/Swift/Kotlin/Scala/SQL/Shell/Markdown).
+- Works with your open workspace files, or falls back to classic algorithm snippets if you don't have a workspace open.
+- Source material is picked from common code file types (TS/JS/React/Vue/Svelte/Astro/Python/Go/Rust/Java/C/C++/C#/Dart/Zig/Lua/Elixir/PHP/Ruby/Swift/Kotlin/Scala/SQL/HTML/CSS/JSON/YAML/Shell/PowerShell/Markdown).

@@ -18,6 +18,12 @@ interface BusySession {
 	typingEnd: number;
 	lineStarts: number[];
 	startedAt?: number;
+	lastKeystrokeAt?: number;
+	activeElapsedMs: number;
+	totalKeystrokes: number;
+	correctKeystrokes: number;
+	errorKeystrokes: number;
+	backspaceCount: number;
 	tempFilePath: string;
 }
 
@@ -27,6 +33,9 @@ export class LookBusyController implements vscode.Disposable {
 	private readonly untypedDecoration: vscode.TextEditorDecorationType;
 	private readonly wrongDecoration: vscode.TextEditorDecorationType;
 	private readonly hiddenDecoration: vscode.TextEditorDecorationType;
+	private readonly emptyLineHintDecoration: vscode.TextEditorDecorationType;
+	private readonly eolHintDecoration: vscode.TextEditorDecorationType;
+	private readonly sessionStatusBarItem: vscode.StatusBarItem;
 	private readonly sessionActiveEmitter = new vscode.EventEmitter<boolean>();
 	private readonly disposables: vscode.Disposable[] = [];
 	private session: BusySession | undefined;
@@ -52,10 +61,32 @@ export class LookBusyController implements vscode.Disposable {
 			textDecoration: 'none; text-decoration-color: transparent; border-bottom: none; outline: none;',
 		});
 
+		this.emptyLineHintDecoration = vscode.window.createTextEditorDecorationType({
+			after: {
+				contentText: '  \u23ce Press Enter',
+				color: new vscode.ThemeColor('editorGhostText.foreground'),
+				fontStyle: 'italic',
+			},
+		});
+
+		this.eolHintDecoration = vscode.window.createTextEditorDecorationType({
+			after: {
+				contentText: ' \u23ce',
+				color: new vscode.ThemeColor('editorGhostText.foreground'),
+			},
+		});
+
+		this.sessionStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 101);
+		this.sessionStatusBarItem.tooltip = 'Look Busy active session (Click or Escape to panic)';
+		this.sessionStatusBarItem.command = 'look-busy.panic';
+
 		this.disposables.push(
 			this.untypedDecoration,
 			this.wrongDecoration,
 			this.hiddenDecoration,
+			this.emptyLineHintDecoration,
+			this.eolHintDecoration,
+			this.sessionStatusBarItem,
 			this.sessionActiveEmitter,
 			vscode.window.onDidChangeTextEditorSelection((event) => {
 				if (!this.session || this.isUpdatingSelection) {
@@ -166,7 +197,15 @@ export class LookBusyController implements vscode.Disposable {
 	}
 
 	private async beginSession(source: SourceContent): Promise<void> {
-		const { uri, tempFilePath } = await this.createTempDocument(source);
+		const lineStarts = buildLineStarts(source.text);
+		const safeTypingStart = this.clampIndex(source.typingStart, source.text.length);
+		const safeTypingEnd = this.clampIndex(source.typingEnd, source.text.length);
+		const currentLine = findLineForIndex(safeTypingStart, lineStarts);
+		const initialWindowEndLine = Math.min(currentLine + 1, lineStarts.length - 1);
+		const initialEnd = lineStarts[initialWindowEndLine] ?? source.text.length;
+		const initialRenderedText = buildMaskedTargetText(source.text, initialEnd);
+
+		const { uri, tempFilePath } = await this.createTempDocument(source, initialRenderedText);
 		let document = await vscode.workspace.openTextDocument(uri);
 
 		if (document.languageId !== source.languageId) {
@@ -184,14 +223,19 @@ export class LookBusyController implements vscode.Disposable {
 			document,
 			editor,
 			target: source.text,
-			renderedText: source.text,
+			renderedText: initialRenderedText,
 			statuses: Array.from({ length: source.text.length }, () => 0),
 			autoFilled: Array.from({ length: source.text.length }, () => false),
-			index: this.clampIndex(source.typingStart, source.text.length),
-			typingStart: this.clampIndex(source.typingStart, source.text.length),
-			typingEnd: this.clampIndex(source.typingEnd, source.text.length),
-			lineStarts: buildLineStarts(source.text),
+			index: safeTypingStart,
+			typingStart: safeTypingStart,
+			typingEnd: safeTypingEnd,
+			lineStarts,
 			tempFilePath,
+			activeElapsedMs: 0,
+			totalKeystrokes: 0,
+			correctKeystrokes: 0,
+			errorKeystrokes: 0,
+			backspaceCount: 0,
 		};
 
 		for (let i = 0; i < this.session.typingStart; i += 1) {
@@ -210,6 +254,9 @@ export class LookBusyController implements vscode.Disposable {
 		this.applyDecorations();
 		this.applyCursor();
 		await this.hideSuggestions();
+
+		this.sessionStatusBarItem.text = '$(pulse) Looking Busy: Ready';
+		this.sessionStatusBarItem.show();
 	}
 
 	private shouldHandleSessionInput(): boolean {
@@ -225,6 +272,60 @@ export class LookBusyController implements vscode.Disposable {
 		return activeEditor.document.uri.toString() === this.session.uri.toString();
 	}
 
+	private recordKeystroke(): void {
+		if (!this.session) {
+			return;
+		}
+
+		const now = Date.now();
+		if (this.session.startedAt === undefined) {
+			this.session.startedAt = now;
+			this.session.lastKeystrokeAt = now;
+			this.session.activeElapsedMs = 0;
+			return;
+		}
+
+		if (this.session.lastKeystrokeAt !== undefined) {
+			const delta = now - this.session.lastKeystrokeAt;
+			const maxIdlePauseMs = 2500;
+			this.session.activeElapsedMs += Math.min(delta, maxIdlePauseMs);
+			this.session.lastKeystrokeAt = now;
+		}
+	}
+
+	private calculateSessionActiveElapsed(session: BusySession): number {
+		if (session.startedAt === undefined || session.lastKeystrokeAt === undefined) {
+			return 0;
+		}
+
+		const trailingDelta = Date.now() - session.lastKeystrokeAt;
+		const maxTrailingMs = 1000;
+		return session.activeElapsedMs + Math.min(trailingDelta, maxTrailingMs);
+	}
+
+	private updateLiveStatusBar(): void {
+		if (!this.session) {
+			this.sessionStatusBarItem.hide();
+			return;
+		}
+
+		const charsTyped = this.countTypedSessionCharacters(this.session);
+		if (charsTyped === 0 || this.session.startedAt === undefined) {
+			this.sessionStatusBarItem.text = '$(pulse) Looking Busy: Ready';
+			return;
+		}
+
+		const activeElapsedMs = this.calculateSessionActiveElapsed(this.session);
+		const stats = calculateStats(charsTyped, activeElapsedMs, {
+			totalKeystrokes: this.session.totalKeystrokes,
+			errors: this.session.errorKeystrokes,
+			backspaces: this.session.backspaceCount,
+			minElapsedMs: 1500,
+		});
+
+		this.sessionStatusBarItem.text = `$(pulse) Looking Busy: ${stats.wpm.toFixed(0)} WPM (${stats.accuracy}%)`;
+	}
+
 	private async consumeInput(text: string): Promise<void> {
 		if (!this.session || text.length === 0) {
 			return;
@@ -232,17 +333,19 @@ export class LookBusyController implements vscode.Disposable {
 
 		await this.hideSuggestions();
 
-		for (const character of Array.from(text)) {
+		const normalizedText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+		for (const character of Array.from(normalizedText)) {
 			if (this.session.index >= this.session.typingEnd) {
 				break;
 			}
 
-			if (this.session.startedAt === undefined) {
-				this.session.startedAt = Date.now();
-			}
+			this.recordKeystroke();
+			this.session.totalKeystrokes += 1;
 
 			const expected = this.session.target[this.session.index];
 			if (character === expected) {
+				this.session.correctKeystrokes += 1;
 				this.session.statuses[this.session.index] = 1;
 				this.session.autoFilled[this.session.index] = false;
 				this.session.index += 1;
@@ -252,24 +355,33 @@ export class LookBusyController implements vscode.Disposable {
 
 			const tabEquivalentLength = this.consumeTabEquivalentIndentation(character);
 			if (tabEquivalentLength > 0) {
-				for (let i = 0; i < tabEquivalentLength; i += 1) {
+				this.session.correctKeystrokes += 1;
+				this.session.statuses[this.session.index] = 1;
+				this.session.autoFilled[this.session.index] = false;
+				for (let i = 1; i < tabEquivalentLength; i += 1) {
 					this.session.statuses[this.session.index + i] = 1;
-					this.session.autoFilled[this.session.index + i] = false;
+					this.session.autoFilled[this.session.index + i] = true;
 				}
 				this.session.index += tabEquivalentLength;
 				this.applyAutomaticIndentation();
 				continue;
 			}
 
+			if (character === '\t') {
+				// Absorb tab when not expecting indentation, preserving alignment
+				continue;
+			}
+
+			// Wrong character typed: mark as error, but do NOT advance index
+			this.session.errorKeystrokes += 1;
 			this.session.statuses[this.session.index] = 2;
 			this.session.autoFilled[this.session.index] = false;
-			this.session.index += 1;
-			this.applyAutomaticIndentation();
 		}
 
 		await this.synchronizeSessionDocument();
 		this.applyDecorations();
 		this.applyCursor();
+		this.updateLiveStatusBar();
 
 		if (this.session.index >= this.session.typingEnd) {
 			await this.completeSession();
@@ -277,12 +389,42 @@ export class LookBusyController implements vscode.Disposable {
 	}
 
 	private async handleBackspace(): Promise<void> {
-		if (!this.session || this.session.index <= this.session.typingStart) {
+		if (!this.session) {
 			return;
 		}
 
-		this.session.index -= 1;
-		if (this.session.index >= this.session.typingStart && this.session.index < this.session.typingEnd) {
+		this.recordKeystroke();
+		this.session.backspaceCount += 1;
+		this.session.totalKeystrokes += 1;
+
+		if (this.session.index <= this.session.typingStart) {
+			this.updateLiveStatusBar();
+			return;
+		}
+
+		// If current character has an uncorrected error, clear it without moving back
+		if (this.session.index < this.session.typingEnd && this.session.statuses[this.session.index] === 2) {
+			this.session.statuses[this.session.index] = 0;
+			await this.synchronizeSessionDocument();
+			this.applyDecorations();
+			this.applyCursor();
+			await this.hideSuggestions();
+			this.updateLiveStatusBar();
+			return;
+		}
+
+		// Roll back preceding auto-filled indentation if any
+		while (
+			this.session.index > this.session.typingStart &&
+			this.session.autoFilled[this.session.index - 1]
+		) {
+			this.session.index -= 1;
+			this.session.statuses[this.session.index] = 0;
+			this.session.autoFilled[this.session.index] = false;
+		}
+
+		if (this.session.index > this.session.typingStart) {
+			this.session.index -= 1;
 			this.session.statuses[this.session.index] = 0;
 			this.session.autoFilled[this.session.index] = false;
 		}
@@ -291,6 +433,7 @@ export class LookBusyController implements vscode.Disposable {
 		this.applyDecorations();
 		this.applyCursor();
 		await this.hideSuggestions();
+		this.updateLiveStatusBar();
 	}
 
 	private applyDecorations(): void {
@@ -305,6 +448,23 @@ export class LookBusyController implements vscode.Disposable {
 		this.session.editor.setDecorations(this.untypedDecoration, untypedRanges);
 		this.session.editor.setDecorations(this.wrongDecoration, wrongRanges);
 		this.session.editor.setDecorations(this.hiddenDecoration, hiddenRanges);
+
+		const emptyLineHints: vscode.Range[] = [];
+		const eolHints: vscode.Range[] = [];
+
+		if (this.session.index < this.session.typingEnd && this.session.target[this.session.index] === '\n') {
+			const pos = this.session.document.positionAt(this.session.index);
+			const lineStart = this.session.target.lastIndexOf('\n', this.session.index - 1) + 1;
+			const lineContentBefore = this.session.target.slice(lineStart, this.session.index);
+			if (lineContentBefore.trim().length === 0) {
+				emptyLineHints.push(new vscode.Range(pos, pos));
+			} else {
+				eolHints.push(new vscode.Range(pos, pos));
+			}
+		}
+
+		this.session.editor.setDecorations(this.emptyLineHintDecoration, emptyLineHints);
+		this.session.editor.setDecorations(this.eolHintDecoration, eolHints);
 	}
 
 	private collectRangesForStatus(status: number, start: number, end: number): vscode.Range[] {
@@ -347,21 +507,7 @@ export class LookBusyController implements vscode.Disposable {
 	}
 
 	private collectHiddenRanges(visibleStart: number, visibleEnd: number): vscode.Range[] {
-		if (!this.session) {
-			return [];
-		}
-
-		const ranges: vscode.Range[] = [];
-		if (visibleEnd < this.session.target.length) {
-			ranges.push(
-				new vscode.Range(
-					this.session.document.positionAt(visibleEnd),
-					this.session.document.positionAt(this.session.target.length)
-				)
-			);
-		}
-
-		return ranges;
+		return [];
 	}
 
 	private applyCursor(): void {
@@ -388,6 +534,7 @@ export class LookBusyController implements vscode.Disposable {
 
 	private async finalizeSession(reason: SessionExitReason, closeEditor: boolean): Promise<void> {
 		if (!this.session) {
+			this.sessionStatusBarItem.hide();
 			await vscode.commands.executeCommand('setContext', 'lookBusy.active', false);
 			this.sessionActiveEmitter.fire(false);
 			return;
@@ -395,12 +542,15 @@ export class LookBusyController implements vscode.Disposable {
 
 		const previousSession = this.session;
 		this.session = undefined;
+		this.sessionStatusBarItem.hide();
 		await vscode.commands.executeCommand('setContext', 'lookBusy.active', false);
 		this.sessionActiveEmitter.fire(false);
 
 		previousSession.editor.setDecorations(this.untypedDecoration, []);
 		previousSession.editor.setDecorations(this.wrongDecoration, []);
 		previousSession.editor.setDecorations(this.hiddenDecoration, []);
+		previousSession.editor.setDecorations(this.emptyLineHintDecoration, []);
+		previousSession.editor.setDecorations(this.eolHintDecoration, []);
 
 		if (closeEditor) {
 			await this.closeSessionEditorWithoutSavePrompt(previousSession);
@@ -465,7 +615,7 @@ export class LookBusyController implements vscode.Disposable {
 		await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
 	}
 
-	private async createTempDocument(source: SourceContent): Promise<{ uri: vscode.Uri; tempFilePath: string }> {
+	private async createTempDocument(source: SourceContent, initialText: string): Promise<{ uri: vscode.Uri; tempFilePath: string }> {
 		const tempDir = path.join(os.tmpdir(), 'look-busy');
 		await fs.mkdir(tempDir, { recursive: true });
 
@@ -473,7 +623,7 @@ export class LookBusyController implements vscode.Disposable {
 		const extension = source.extension.startsWith('.') ? source.extension : '.txt';
 		const tempFilePath = path.join(tempDir, `look-busy-${nonce}${extension}`);
 
-		await fs.writeFile(tempFilePath, source.text, 'utf8');
+		await fs.writeFile(tempFilePath, initialText, 'utf8');
 
 		const uri = vscode.Uri.file(tempFilePath);
 		return {
@@ -576,7 +726,7 @@ export class LookBusyController implements vscode.Disposable {
 	private countTypedSessionCharacters(session: BusySession): number {
 		let typed = 0;
 		for (let i = session.typingStart; i < session.typingEnd; i += 1) {
-			if (session.statuses[i] !== 0 && !session.autoFilled[i]) {
+			if (session.statuses[i] === 1 && !session.autoFilled[i]) {
 				typed += 1;
 			}
 		}
@@ -643,13 +793,26 @@ export class LookBusyController implements vscode.Disposable {
 	}
 
 	private showSessionExitStats(session: BusySession, reason: SessionExitReason): void {
-		const elapsedMs = session.startedAt !== undefined ? Date.now() - session.startedAt : 0;
 		const charsTyped = this.countTypedSessionCharacters(session);
-		const stats = calculateStats(charsTyped, elapsedMs);
 		const reasonLabel = getSessionExitLabel(reason);
+
+		if (charsTyped === 0) {
+			void vscode.window.showInformationMessage(`Session ${reasonLabel} | No typing recorded`);
+			return;
+		}
+
+		const activeElapsedMs = this.calculateSessionActiveElapsed(session);
+		const stats = calculateStats(charsTyped, activeElapsedMs, {
+			totalKeystrokes: session.totalKeystrokes,
+			errors: session.errorKeystrokes,
+			backspaces: session.backspaceCount,
+			minElapsedMs: 1500,
+		});
+
 		const message = [
 			`Session ${reasonLabel}`,
 			`WPM: ${stats.wpm.toFixed(1)}`,
+			`Acc: ${stats.accuracy}%`,
 			getSnarkyComment(stats.wpm),
 		].join(' | ');
 
@@ -694,17 +857,7 @@ function buildMaskedTargetText(target: string, visibleEnd: number): string {
 		return target;
 	}
 
-	let output = '';
-	for (let i = 0; i < target.length; i += 1) {
-		if (i < visibleEnd) {
-			output += target[i];
-			continue;
-		}
-
-		output += target[i] === '\n' ? '\n' : ' ';
-	}
-
-	return output;
+	return target.slice(0, visibleEnd);
 }
 
 export function getTabEquivalentIndentationLength(target: string, index: number, typingEnd: number): number {

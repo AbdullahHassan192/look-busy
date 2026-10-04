@@ -23,7 +23,8 @@
     "ai"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onCommand:look-busy.start"
   ],
   "engines": {
     "vscode": "^1.115.0"
@@ -78,6 +79,14 @@
       {
         "command": "look-busy.injectText",
         "key": "enter",
+        "args": {
+          "text": "\n"
+        },
+        "when": "lookBusy.active && editorTextFocus"
+      },
+      {
+        "command": "look-busy.injectText",
+        "key": "shift+enter",
         "args": {
           "text": "\n"
         },

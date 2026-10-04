@@ -25,7 +25,12 @@ interface WorkspaceGitignoreMatcher {
 	rules: GitignoreRule[];
 }
 
+export interface SignalCheckOptions {
+	isActiveFile?: boolean;
+}
+
 const EXTRA_WORKSPACE_EXTENSIONS = [
+	'c',
 	'php',
 	'rb',
 	'swift',
@@ -33,7 +38,34 @@ const EXTRA_WORKSPACE_EXTENSIONS = [
 	'scala',
 	'sql',
 	'sh',
+	'bash',
+	'zsh',
+	'ps1',
 	'md',
+	'vue',
+	'svelte',
+	'astro',
+	'dart',
+	'zig',
+	'lua',
+	'ex',
+	'exs',
+	'erl',
+	'hrl',
+	'html',
+	'htm',
+	'css',
+	'scss',
+	'sass',
+	'less',
+	'json',
+	'jsonc',
+	'yaml',
+	'yml',
+	'toml',
+	'prisma',
+	'graphql',
+	'gql',
 ];
 
 const CANDIDATE_EXTENSIONS = Array.from(
@@ -57,6 +89,9 @@ const DEFAULT_IGNORED_DIRECTORIES = new Set([
 	'coverage',
 	'build',
 	'.next',
+	'.nuxt',
+	'.svelte-kit',
+	'.astro',
 	'target',
 	'bin',
 	'obj',
@@ -75,11 +110,14 @@ const IMPORT_PATTERNS: RegExp[] = [
 	/^\s*import\b/i,
 	/^\s*from\b.+\bimport\b/i,
 	/^\s*#include\b/i,
-	/^\s*using\s+namespace\b/i,
-	/^\s*package\s+[^;]+;\s*$/i,
-	/^\s*namespace\s+[^;{]+;\s*$/i,
+	/^\s*using\s+[a-zA-Z0-9_.:]+;?\s*$/i,
+	/^\s*package\s+[^;]+;?\s*$/i,
+	/^\s*namespace\s+[^;{]+;?\s*$/i,
 	/^\s*const\s+\w+\s*=\s*require\(/i,
 	/^\s*export\s+\{.*\}\s+from\b/i,
+	/^\s*use\s+[a-zA-Z0-9_:]+/i,
+	/^\s*@(import|use|forward)\b/i,
+	/^\s*require(_relative)?\b/i,
 ];
 
 const MID_FILE_START_PROBABILITY = 0.5;
@@ -88,7 +126,42 @@ const MIN_OFFSET_FROM_BASE_START = 60;
 const MID_FILE_WINDOW_RATIO = 0.2;
 
 export async function getWorkspaceSource(): Promise<SourceContent | undefined> {
-	return getWorkspaceSnippet();
+	const workspaceSnippet = await getWorkspaceSnippet();
+	if (workspaceSnippet) {
+		return workspaceSnippet;
+	}
+
+	const activeLanguageId = vscode.window.activeTextEditor?.document.languageId;
+	return getFallbackAlgorithmSource(activeLanguageId);
+}
+
+export function getFallbackAlgorithmSource(preferredLanguageId?: string): SourceContent {
+	let pack = preferredLanguageId
+		? LANGUAGE_SNIPPET_PACKS.find((p) => p.languageId === preferredLanguageId)
+		: undefined;
+
+	if (!pack) {
+		pack = LANGUAGE_SNIPPET_PACKS[Math.floor(Math.random() * LANGUAGE_SNIPPET_PACKS.length)];
+	}
+
+	const snippet = pack.snippets[Math.floor(Math.random() * pack.snippets.length)];
+	const text = [
+		...snippet.prefixLines,
+		snippet.typedBlock,
+		...snippet.suffixLines,
+	].join('\n');
+
+	const typingStart = snippet.prefixLines.length > 0
+		? snippet.prefixLines.join('\n').length + 1
+		: 0;
+
+	return {
+		text,
+		languageId: pack.languageId,
+		extension: pack.extension,
+		typingStart,
+		typingEnd: text.length,
+	};
 }
 
 export function inferLanguageFromPath(filePath: string): Pick<SourceContent, 'languageId' | 'extension'> {
@@ -100,9 +173,17 @@ export function inferLanguageFromPath(filePath: string): Pick<SourceContent, 'la
 		case '.tsx':
 			return { languageId: 'typescriptreact', extension: '.tsx' };
 		case '.js':
+		case '.mjs':
+		case '.cjs':
 			return { languageId: 'javascript', extension: '.js' };
 		case '.jsx':
 			return { languageId: 'javascriptreact', extension: '.jsx' };
+		case '.vue':
+			return { languageId: 'vue', extension: '.vue' };
+		case '.svelte':
+			return { languageId: 'svelte', extension: '.svelte' };
+		case '.astro':
+			return { languageId: 'astro', extension: '.astro' };
 		case '.py':
 			return { languageId: 'python', extension: '.py' };
 		case '.go':
@@ -111,14 +192,14 @@ export function inferLanguageFromPath(filePath: string): Pick<SourceContent, 'la
 			return { languageId: 'rust', extension: '.rs' };
 		case '.java':
 			return { languageId: 'java', extension: '.java' };
+		case '.c':
+			return { languageId: 'c', extension: '.c' };
 		case '.cpp':
 		case '.cc':
 		case '.cxx':
 		case '.hpp':
 		case '.h':
 			return { languageId: 'cpp', extension: '.cpp' };
-		case '.c':
-			return { languageId: 'c', extension: '.c' };
 		case '.cs':
 			return { languageId: 'csharp', extension: '.cs' };
 		case '.php':
@@ -131,10 +212,51 @@ export function inferLanguageFromPath(filePath: string): Pick<SourceContent, 'la
 			return { languageId: 'kotlin', extension: '.kt' };
 		case '.scala':
 			return { languageId: 'scala', extension: '.scala' };
+		case '.dart':
+			return { languageId: 'dart', extension: '.dart' };
+		case '.zig':
+			return { languageId: 'zig', extension: '.zig' };
+		case '.lua':
+			return { languageId: 'lua', extension: '.lua' };
+		case '.ex':
+		case '.exs':
+			return { languageId: 'elixir', extension: '.ex' };
+		case '.erl':
+		case '.hrl':
+			return { languageId: 'erlang', extension: '.erl' };
 		case '.sql':
 			return { languageId: 'sql', extension: '.sql' };
+		case '.html':
+		case '.htm':
+			return { languageId: 'html', extension: '.html' };
+		case '.css':
+			return { languageId: 'css', extension: '.css' };
+		case '.scss':
+			return { languageId: 'scss', extension: '.scss' };
+		case '.sass':
+			return { languageId: 'sass', extension: '.sass' };
+		case '.less':
+			return { languageId: 'less', extension: '.less' };
+		case '.json':
+		case '.jsonc':
+			return { languageId: 'json', extension: '.json' };
+		case '.yaml':
+		case '.yml':
+			return { languageId: 'yaml', extension: '.yaml' };
+		case '.toml':
+			return { languageId: 'toml', extension: '.toml' };
+		case '.prisma':
+			return { languageId: 'prisma', extension: '.prisma' };
+		case '.graphql':
+		case '.gql':
+			return { languageId: 'graphql', extension: '.graphql' };
 		case '.sh':
+		case '.bash':
+		case '.zsh':
 			return { languageId: 'shellscript', extension: '.sh' };
+		case '.ps1':
+		case '.psm1':
+			return { languageId: 'powershell', extension: '.ps1' };
 		case '.md':
 			return { languageId: 'markdown', extension: '.md' };
 		default:
@@ -144,16 +266,16 @@ export function inferLanguageFromPath(filePath: string): Pick<SourceContent, 'la
 
 async function getWorkspaceSnippet(): Promise<SourceContent | undefined> {
 	if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
-		void vscode.window.showWarningMessage('Open a workspace to start a Look Busy coding session.');
+		void vscode.window.showInformationMessage('No open workspace found. Loaded a classic algorithm snippet to look busy!');
 		return undefined;
 	}
 
 	const include = `**/*.{${CANDIDATE_EXTENSIONS.join(',')}}`;
-	const exclude = '**/{node,node_modules,.git,.vscode,.idea,.venv,venv,env,dist,out,coverage,build,.next,target,bin,obj,vendor,.turbo,__pycache__,.pytest_cache,.mypy_cache,.tox,.pnpm-store,.yarn,.cache}/**';
+	const exclude = '**/{node,node_modules,.git,.vscode,.idea,.venv,venv,env,dist,out,coverage,build,.next,.nuxt,.svelte-kit,.astro,target,bin,obj,vendor,.turbo,__pycache__,.pytest_cache,.mypy_cache,.tox,.pnpm-store,.yarn,.cache}/**';
 	const files = await vscode.workspace.findFiles(include, exclude, 2000);
 
 	if (files.length === 0) {
-		void vscode.window.showWarningMessage('No supported workspace files were found for a Look Busy session.');
+		void vscode.window.showInformationMessage('No supported workspace files found. Loaded a classic algorithm snippet to look busy!');
 		return undefined;
 	}
 
@@ -165,7 +287,7 @@ async function getWorkspaceSnippet(): Promise<SourceContent | undefined> {
 		!isUriInDefaultIgnoredDirectory(activeUri) &&
 		!isUriIgnoredByWorkspaceGitignore(activeUri, gitignoreMatchers)
 	) {
-		const activeSource = await buildSourceFromFile(activeUri);
+		const activeSource = await buildSourceFromFile(activeUri, { isActiveFile: true });
 		if (activeSource) {
 			return activeSource;
 		}
@@ -175,49 +297,85 @@ async function getWorkspaceSnippet(): Promise<SourceContent | undefined> {
 		(file) => !isUriInDefaultIgnoredDirectory(file) && !isUriIgnoredByWorkspaceGitignore(file, gitignoreMatchers)
 	);
 	if (eligibleFiles.length === 0) {
-		void vscode.window.showWarningMessage('All supported workspace files are excluded by .gitignore.');
+		void vscode.window.showInformationMessage('All workspace files are excluded by .gitignore. Loaded a classic algorithm snippet to look busy!');
 		return undefined;
 	}
 
 	const prioritizedFiles = prioritizeWorkspaceFiles(eligibleFiles, activeUri);
 	for (const selectedFile of prioritizedFiles.slice(0, 200)) {
-		const source = await buildSourceFromFile(selectedFile);
+		const source = await buildSourceFromFile(selectedFile, { isActiveFile: false });
 		if (source) {
 			return source;
 		}
 	}
 
-	void vscode.window.showWarningMessage('Could not find a good workspace code block to practice typing.');
+	void vscode.window.showInformationMessage('Could not find a suitable workspace code block. Loaded a classic algorithm snippet to look busy!');
 	return undefined;
 }
 
-async function buildSourceFromFile(file: vscode.Uri): Promise<SourceContent | undefined> {
-	const bytes = await vscode.workspace.fs.readFile(file);
-	if (bytes.byteLength > 200_000) {
+async function getFileContent(file: vscode.Uri): Promise<string | undefined> {
+	const openDoc = vscode.workspace.textDocuments.find(
+		(doc) => doc.uri.toString() === file.toString()
+	);
+	if (openDoc) {
+		const text = openDoc.getText();
+		if (text.length > 200_000) {
+			return undefined;
+		}
+		return stripLeadingBom(text);
+	}
+
+	try {
+		const bytes = await vscode.workspace.fs.readFile(file);
+		if (bytes.byteLength > 200_000) {
+			return undefined;
+		}
+		return stripLeadingBom(new TextDecoder('utf-8').decode(bytes));
+	} catch {
+		return undefined;
+	}
+}
+
+async function buildSourceFromFile(
+	file: vscode.Uri,
+	options: SignalCheckOptions = {}
+): Promise<SourceContent | undefined> {
+	const text = await getFileContent(file);
+	if (!text) {
 		return undefined;
 	}
 
-	const text = stripLeadingBom(new TextDecoder('utf-8').decode(bytes));
-	if (isLowSignalWorkspaceFile(file, text)) {
+	if (isLowSignalWorkspaceFile(file, text, options)) {
 		return undefined;
 	}
 
 	const language = inferLanguageFromPath(file.fsPath);
-	return buildFullFileSource(text, language.languageId, language.extension);
+	const source = buildFullFileSource(text, language.languageId, language.extension);
+
+	if (source.typingEnd - source.typingStart < 40) {
+		return undefined;
+	}
+
+	return source;
 }
 
-function prioritizeWorkspaceFiles(files: vscode.Uri[], activeUri: vscode.Uri | undefined): vscode.Uri[] {
+export function prioritizeWorkspaceFiles(
+	files: vscode.Uri[],
+	activeUri: vscode.Uri | undefined,
+	random: () => number = Math.random
+): vscode.Uri[] {
 	const activeFilePath = activeUri?.fsPath;
 	const decorated = files.map((uri) => ({
 		uri,
 		score: scoreWorkspaceFilePath(uri.fsPath, activeFilePath),
+		randomWeight: random(),
 	}));
 
 	decorated.sort((a, b) => {
 		if (b.score !== a.score) {
 			return b.score - a.score;
 		}
-		return a.uri.fsPath.localeCompare(b.uri.fsPath);
+		return a.randomWeight - b.randomWeight;
 	});
 
 	return decorated.map((entry) => entry.uri);
@@ -261,7 +419,14 @@ export function scoreWorkspaceFilePath(filePath: string, activeFilePath: string 
 		}
 	}
 
-	if (normalizedPath.includes('/src/') || normalizedPath.includes('/app/') || normalizedPath.includes('/lib/')) {
+	if (
+		normalizedPath.includes('/src/') ||
+		normalizedPath.includes('/app/') ||
+		normalizedPath.includes('/lib/') ||
+		normalizedPath.includes('/components/') ||
+		normalizedPath.includes('/pages/') ||
+		normalizedPath.includes('/views/')
+	) {
 		score += 60;
 	}
 
@@ -269,7 +434,18 @@ export function scoreWorkspaceFilePath(filePath: string, activeFilePath: string 
 		score -= 200;
 	}
 
-	if (normalizedPath.includes('/test/') || normalizedPath.includes('/__tests__/') || lowerPath.includes('.spec.')) {
+	if (
+		normalizedPath.includes('/test/') ||
+		normalizedPath.includes('/tests/') ||
+		normalizedPath.includes('/__tests__/') ||
+		normalizedPath.includes('/fixture/') ||
+		normalizedPath.includes('/fixtures/') ||
+		normalizedPath.includes('/__fixtures__/') ||
+		normalizedPath.includes('/mock/') ||
+		normalizedPath.includes('/mocks/') ||
+		lowerPath.includes('.spec.') ||
+		lowerPath.includes('.test.')
+	) {
 		score -= 40;
 	}
 
@@ -282,22 +458,47 @@ async function loadWorkspaceGitignoreMatchers(): Promise<WorkspaceGitignoreMatch
 	}
 
 	const matchers: WorkspaceGitignoreMatcher[] = [];
-	for (const folder of vscode.workspace.workspaceFolders) {
-		const gitignoreUri = vscode.Uri.joinPath(folder.uri, '.gitignore');
-		const content = await readWorkspaceTextFile(gitignoreUri);
-		if (!content) {
-			continue;
-		}
+	try {
+		const gitignoreUris = await vscode.workspace.findFiles(
+			'**/.gitignore',
+			'**/{node_modules,.git,.venv,venv,dist,out,target,vendor}/**',
+			50
+		);
 
-		const rules = parseGitignoreRules(content);
-		if (rules.length === 0) {
-			continue;
-		}
+		for (const gitignoreUri of gitignoreUris) {
+			const content = await readWorkspaceTextFile(gitignoreUri);
+			if (!content) {
+				continue;
+			}
 
-		matchers.push({
-			folderUri: folder.uri,
-			rules,
-		});
+			const rules = parseGitignoreRules(content);
+			if (rules.length === 0) {
+				continue;
+			}
+
+			matchers.push({
+				folderUri: vscode.Uri.file(path.dirname(gitignoreUri.fsPath)),
+				rules,
+			});
+		}
+	} catch {
+		for (const folder of vscode.workspace.workspaceFolders) {
+			const gitignoreUri = vscode.Uri.joinPath(folder.uri, '.gitignore');
+			const content = await readWorkspaceTextFile(gitignoreUri);
+			if (!content) {
+				continue;
+			}
+
+			const rules = parseGitignoreRules(content);
+			if (rules.length === 0) {
+				continue;
+			}
+
+			matchers.push({
+				folderUri: folder.uri,
+				rules,
+			});
+		}
 	}
 
 	return matchers;
@@ -408,7 +609,7 @@ function globToRegexBody(pattern: string): string {
 }
 
 function escapeRegexCharacter(character: string): string {
-	if (/[[\]{}()*+?.\\^$|]/.test(character)) {
+	if ('^$.*+?()[]{}|\\'.includes(character)) {
 		return `\\${character}`;
 	}
 
@@ -454,86 +655,250 @@ export function stripLeadingBom(text: string): string {
 	return text;
 }
 
+function countDelimiterDelta(line: string): number {
+	let delta = 0;
+	for (const ch of line) {
+		if (ch === '{' || ch === '(' || ch === '[') {
+			delta += 1;
+		} else if (ch === '}' || ch === ')' || ch === ']') {
+			delta -= 1;
+		}
+	}
+	return delta;
+}
+
+function isSingleLineBoilerplate(line: string): boolean {
+	if (/^\s*#!/.test(line)) {
+		return true;
+	}
+
+	if (/^\s*['"]use strict['"];?\s*$/i.test(line)) {
+		return true;
+	}
+
+	if (/^\s*(\/\/|#|\*|--|%)/.test(line)) {
+		return true;
+	}
+
+	return false;
+}
+
 export function getFullFileTypingBounds(text: string): FullFileTypingBounds {
 	const normalized = text.replace(/\r\n/g, '\n');
 	const lines = normalized.split('\n');
 	let typingStart = 0;
+	let currentOffset = 0;
 
-	for (let i = 0; i < lines.length; i += 1) {
-		const line = lines[i];
-		const lineLengthWithNewline = line.length + (i < lines.length - 1 ? 1 : 0);
+	let inBlockComment = false;
+	let inHtmlComment = false;
+	let delimiterDelta = 0;
+
+	for (const line of lines) {
 		const trimmed = line.trim();
 
-		if (trimmed.length === 0 || isBoilerplateLine(line)) {
-			typingStart += lineLengthWithNewline;
+		if (trimmed.length === 0) {
+			currentOffset += line.length + 1;
+			typingStart = currentOffset;
+			continue;
+		}
+
+		if (inBlockComment) {
+			if (line.includes('*/')) {
+				inBlockComment = false;
+			}
+			currentOffset += line.length + 1;
+			typingStart = currentOffset;
+			continue;
+		}
+
+		if (inHtmlComment) {
+			if (line.includes('-->')) {
+				inHtmlComment = false;
+			}
+			currentOffset += line.length + 1;
+			typingStart = currentOffset;
+			continue;
+		}
+
+		if (delimiterDelta > 0) {
+			delimiterDelta += countDelimiterDelta(line);
+			if (delimiterDelta < 0) {
+				delimiterDelta = 0;
+			}
+			currentOffset += line.length + 1;
+			typingStart = currentOffset;
+			continue;
+		}
+
+		if (/^\s*\/\*/.test(line)) {
+			if (!line.includes('*/')) {
+				inBlockComment = true;
+			}
+			currentOffset += line.length + 1;
+			typingStart = currentOffset;
+			continue;
+		}
+
+		if (/^\s*<!--/.test(line)) {
+			if (!line.includes('-->')) {
+				inHtmlComment = true;
+			}
+			currentOffset += line.length + 1;
+			typingStart = currentOffset;
+			continue;
+		}
+
+		if (isSingleLineBoilerplate(line)) {
+			currentOffset += line.length + 1;
+			typingStart = currentOffset;
+			continue;
+		}
+
+		if (isImportLikeLine(line)) {
+			const delta = countDelimiterDelta(line);
+			if (delta > 0) {
+				delimiterDelta = delta;
+			}
+			currentOffset += line.length + 1;
+			typingStart = currentOffset;
 			continue;
 		}
 
 		break;
 	}
 
-	if (typingStart >= normalized.length) {
-		typingStart = 0;
+	let clampedStart = clampIndex(typingStart, normalized.length);
+	if (clampedStart >= normalized.length) {
+		clampedStart = 0;
 	}
 
 	return {
-		typingStart,
+		typingStart: clampedStart,
 		typingEnd: normalized.length,
 	};
 }
 
 export function chooseSessionTypingStart(
 	text: string,
-	baseTypingStart: number,
+	baseStart: number,
 	random: () => number = Math.random
 ): number {
 	const normalized = text.replace(/\r\n/g, '\n');
-	const safeBaseStart = clampIndex(baseTypingStart, normalized.length);
+	const safeBaseStart = clampIndex(baseStart, normalized.length);
+	const lineStarts = collectLineStartCandidates(normalized, safeBaseStart);
+
+	if (lineStarts.length === 0) {
+		return safeBaseStart;
+	}
+
+	const firstSafeLine = lineStarts[0];
+	const remainingCharacters = normalized.length - safeBaseStart;
+	if (remainingCharacters < MIN_CHARACTERS_FOR_MID_FILE_START) {
+		return firstSafeLine;
+	}
 
 	if (random() < (1 - MID_FILE_START_PROBABILITY)) {
-		return safeBaseStart;
+		return firstSafeLine;
 	}
 
-	const remainingLength = normalized.length - safeBaseStart;
-	if (remainingLength < MIN_CHARACTERS_FOR_MID_FILE_START) {
-		return safeBaseStart;
+	const midpoint = safeBaseStart + Math.floor(remainingCharacters / 2);
+	const maxDistance = Math.max(30, Math.floor(remainingCharacters * MID_FILE_WINDOW_RATIO));
+
+	const midCandidates = lineStarts.filter((candidate) => {
+		if (candidate - safeBaseStart < MIN_OFFSET_FROM_BASE_START) {
+			return false;
+		}
+
+		return Math.abs(candidate - midpoint) <= maxDistance;
+	});
+
+	if (midCandidates.length === 0) {
+		return firstSafeLine;
 	}
 
-	const minCandidateStart = safeBaseStart + Math.min(MIN_OFFSET_FROM_BASE_START, Math.floor(remainingLength / 3));
-	const candidates = collectLineStartCandidates(normalized, minCandidateStart);
-	if (candidates.length === 0) {
-		return safeBaseStart;
-	}
-
-	const midpoint = safeBaseStart + Math.floor(remainingLength / 2);
-	const midWindow = Math.max(30, Math.floor(remainingLength * MID_FILE_WINDOW_RATIO));
-	const aroundMiddleCandidates = candidates.filter((start) => Math.abs(start - midpoint) <= midWindow);
-	const pool = aroundMiddleCandidates.length > 0 ? aroundMiddleCandidates : candidates;
-	const selectedIndex = Math.floor(random() * pool.length);
-
-	return pool[selectedIndex] ?? safeBaseStart;
+	const candidateIndex = Math.min(
+		midCandidates.length - 1,
+		Math.max(0, Math.floor(random() * midCandidates.length))
+	);
+	return midCandidates[candidateIndex];
 }
 
-function isLowSignalWorkspaceFile(uri: vscode.Uri, text: string): boolean {
-	const lowerPath = uri.fsPath.toLowerCase();
-	if (lowerPath.includes('.min.') || lowerPath.endsWith('.d.ts') || lowerPath.includes('.generated.')) {
+export function isLockOrMapFile(fileName: string): boolean {
+	const lower = fileName.toLowerCase();
+	if (lower.endsWith('.map')) {
+		return true;
+	}
+	if (
+		lower.endsWith('.lock') ||
+		lower.endsWith('.lockb') ||
+		lower === 'package-lock.json' ||
+		lower === 'pnpm-lock.yaml' ||
+		lower === 'pnpm-lock.yml' ||
+		lower === 'shrinkwrap.yaml' ||
+		lower === 'npm-shrinkwrap.json' ||
+		lower === 'gemfile.lock' ||
+		lower === 'cargo.lock' ||
+		lower === 'poetry.lock' ||
+		lower === 'composer.lock' ||
+		lower === 'flake.lock' ||
+		/(^|[.-])lock([.-]|$)/i.test(lower)
+	) {
+		return true;
+	}
+	return false;
+}
+
+export function isLowSignalWorkspaceFile(
+	file: vscode.Uri,
+	text: string,
+	options: SignalCheckOptions = {}
+): boolean {
+	const lowerName = path.basename(file.fsPath).toLowerCase();
+	if (
+		lowerName.endsWith('.d.ts') ||
+		lowerName.endsWith('.min.js') ||
+		lowerName.endsWith('.min.css') ||
+		lowerName.includes('.min.') ||
+		lowerName.includes('.bundle.') ||
+		lowerName.includes('.generated.')
+	) {
+		return true;
+	}
+
+	if (isLockOrMapFile(lowerName)) {
+		return true;
+	}
+
+	if (
+		lowerName.startsWith('license') ||
+		lowerName.startsWith('licence') ||
+		lowerName.startsWith('changelog') ||
+		lowerName.startsWith('changes')
+	) {
 		return true;
 	}
 
 	const normalized = text.replace(/\r\n/g, '\n');
 	const lines = normalized.split('\n');
-	if (lines.length < 12) {
+
+	const minLines = options.isActiveFile ? 3 : 5;
+	const minChars = options.isActiveFile ? 30 : 60;
+	if (lines.length < minLines || text.trim().length < minChars) {
 		return true;
 	}
 
-	let veryLongLineCount = 0;
+	const isMarkdown = lowerName.endsWith('.md');
+	const maxAllowedLineLength = isMarkdown ? 3000 : 1000;
+
 	for (const line of lines) {
-		if (line.length > 240) {
-			veryLongLineCount += 1;
-			if (veryLongLineCount >= 3) {
-				return true;
-			}
+		if (line.length > maxAllowedLineLength) {
+			return true;
 		}
+	}
+
+	const averageLineLength = lines.length > 0 ? text.length / lines.length : 0;
+	if (!isMarkdown && averageLineLength > 300) {
+		return true;
 	}
 
 	return false;
@@ -584,26 +949,6 @@ function isImportLikeLine(line: string): boolean {
 		if (pattern.test(line)) {
 			return true;
 		}
-	}
-
-	return false;
-}
-
-function isBoilerplateLine(line: string): boolean {
-	if (/^\s*#!/.test(line)) {
-		return true;
-	}
-
-	if (/^\s*['\"]use strict['\"];?\s*$/i.test(line)) {
-		return true;
-	}
-
-	if (/^\s*(\/\/|#|\/\*|\*|--)/.test(line)) {
-		return true;
-	}
-
-	if (isImportLikeLine(line)) {
-		return true;
 	}
 
 	return false;

@@ -1,31 +1,40 @@
 # Look Busy
 
-Tired of watching reels between AI prompts?
+Terrified your boss will replace you with an agent if they catch you scrolling reels between prompts?
 
-**Look Busy** is a VS Code extension for people who want to look or feel intensely productive while their favourite AI coworker does the heavy lifting.
+**Look Busy** launches a Monkeytype-style typing session directly inside your editor using real code from your current project. So you can hand off a task to Claude, Copilot, or Antigravity, trigger Look Busy, and look intensely productive until the prompt finishes.
 
-It gives you monkeytype-style typing practice using snippets from your own code, so from a distance it looks like you are shipping features at warp speed.
+![Look Busy demo](media/demo.gif)
 
-![Look Busy demo](media/look-busy-demo.gif)
-![Start from status bar](media/statusbar-start.png)
-![Panic exit](media/panic-exit.png)
+## How it works
 
-## What this masterpiece does
+When an AI prompt takes time to run, spinning in your chair or checking your phone invites questions. Look Busy gives your hands something urgent to do:
 
-- Starts a typing session from real workspace files.
-- Skips leading import/header boilerplate so you are not grinding through `import x from y` forever.
-- Sometimes starts around the middle of longer files, because fake productivity deserves variety.
-- Highlights untyped and mistyped characters as you type.
-- Includes a panic kill switch: `Esc` (for when your boss spawns behind you to check if you can be replaced by an AI agent or not).
-- Shows your WPM when the session ends, so you can measure how fast you can pretend.
+- **Uses your own code.** It pulls functions and classes directly from your active project.
+- **Ghost text guidance.** Upcoming code renders in muted ghost text. As you type, matching characters lock in and the cursor advances.
+- **Panic switch (`Esc`).** Hit escape at any moment. The mock document closes instantly with no save dialogs, leaving your workspace completely clean.
+- **Exit stats.** Every session calculates your typing speed and displays your WPM.
 
-## How to start looking busy
+## Safe by design
 
-- Status bar: **Start Looking Busy** (one click).
-- Command Palette: **Look Busy: Start Workspace Session**
-- Shortcut: `Ctrl+Alt+B` / `Cmd+Alt+B`
+Look Busy runs inside temporary throwaway files. It never edits your actual project files, never stages uncommitted changes, and never prompts you to save on exit.
 
-## Notes
+## How to use
 
-- Works with your open workspace files, or falls back to classic algorithm snippets if you don't have a workspace open.
-- Source material is picked from common code file types (TS/JS/React/Vue/Svelte/Astro/Python/Go/Rust/Java/C/C++/C#/Dart/Zig/Lua/Elixir/PHP/Ruby/Swift/Kotlin/Scala/SQL/HTML/CSS/JSON/YAML/Shell/PowerShell/Markdown).
+Start a session:
+- **Status bar:** Click **Start Looking Busy** in the bottom status bar.
+- **Shortcut:** `Ctrl+Alt+B` (Windows/Linux) or `Cmd+Alt+B` (macOS).
+- **Command Palette:** Run `Look Busy: Start Workspace Session`.
+
+Exit a session:
+- Press `Esc` at any time to immediately close the session and view your stats.
+
+## Supported languages
+
+Look Busy detects and styles code across more than 30 formats, including TypeScript, JavaScript, Python, Go, Rust, Java, C/C++, C#, Dart, Zig, Lua, Elixir, PHP, Ruby, Swift, Kotlin, SQL, HTML, CSS, and Markdown.
+
+If you start a session without an open workspace, the extension falls back to a built-in pack of classic algorithms and data structures.
+
+## Feedback
+
+Found an issue or want to suggest new exit messages? Open an issue on [GitHub](https://github.com/AbdullahHassan192/look-busy/issues).

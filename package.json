@@ -3,7 +3,7 @@
   "displayName": "Look Busy",
   "description": "Pretend to look busy while AI writes your code",
   "publisher": "AbdullahHassan",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "icon": "media/look-busy-icon.png",
   "license": "MIT",
   "repository": {
@@ -32,6 +32,15 @@
   "categories": [
     "Other"
   ],
+  "extensionKind": [
+    "ui"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Look Busy reads source files from your workspace to build a typing session."
+    }
+  },
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -63,6 +72,38 @@
           "when": "false"
         }
       ]
+    },
+    "configuration": {
+      "title": "Look Busy",
+      "properties": {
+        "lookBusy.source": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "workspace",
+            "builtin"
+          ],
+          "enumDescriptions": [
+            "Use a workspace file when one is available, otherwise a built-in algorithm.",
+            "Only use workspace files, and report that no session could start if none qualify.",
+            "Never read the workspace, always use a built-in algorithm."
+          ],
+          "default": "auto",
+          "description": "Where Look Busy takes the code you type."
+        },
+        "lookBusy.ghostLinesAhead": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Lines of upcoming code rendered in ghost text past the cursor. 1 shows the rest of the current line."
+        },
+        "lookBusy.showStatusBarButton": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the Start Looking Busy button in the status bar."
+        }
+      }
     },
     "keybindings": [
       {
@@ -153,6 +194,7 @@
     "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
     "package": "npm run check-types && npm run lint && node esbuild.js --production",
     "compile-tests": "tsc -p . --outDir out",
+    "precompile-tests": "node -e \"require('fs').rmSync('out',{recursive:true,force:true})\"",
     "watch-tests": "tsc -p . -w --outDir out",
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "check-types": "tsc --noEmit",
@@ -160,15 +202,16 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.90.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
-    "typescript-eslint": "^8.56.1",
-    "eslint": "^9.39.3",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.27.3",
+    "eslint": "^9.39.3",
     "npm-run-all": "^4.1.5",
     "typescript": "^5.9.3",
-    "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.5.2"
+    "typescript-eslint": "^8.56.1"
   }
 }

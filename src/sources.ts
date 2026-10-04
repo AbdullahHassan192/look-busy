@@ -20,14 +20,27 @@ export interface GitignoreRule {
 	regex: RegExp;
 }
 
-interface WorkspaceGitignoreMatcher {
-	folderUri: vscode.Uri;
+export interface GitignoreMatcher {
+	rootPath: string;
 	rules: GitignoreRule[];
 }
 
 export interface SignalCheckOptions {
 	isActiveFile?: boolean;
 }
+
+export interface SourceSelectionOptions {
+	token?: vscode.CancellationToken;
+	preferWorkspace?: boolean;
+	/** When true, no built-in fallback is used and undefined is returned instead. */
+	requireWorkspace?: boolean;
+}
+
+const MAX_WORKSPACE_FILES = 2000;
+const MAX_CANDIDATE_FILES = 200;
+const MAX_GITIGNORE_FILES = 50;
+const MAX_SOURCE_FILE_BYTES = 200_000;
+const MIN_TYPABLE_CHARACTERS = 40;
 
 const EXTRA_WORKSPACE_EXTENSIONS = [
 	'c',
@@ -74,6 +87,9 @@ const CANDIDATE_EXTENSIONS = Array.from(
 		...EXTRA_WORKSPACE_EXTENSIONS,
 	])
 );
+
+const WORKSPACE_SEARCH_EXCLUDE =
+	'**/{node,node_modules,.git,.vscode,.idea,.venv,venv,env,dist,out,coverage,build,.next,.nuxt,.svelte-kit,.astro,target,bin,obj,vendor,.turbo,__pycache__,.pytest_cache,.mypy_cache,.tox,.pnpm-store,.yarn,.cache}/**';
 
 const DEFAULT_IGNORED_DIRECTORIES = new Set([
 	'.git',
@@ -125,35 +141,54 @@ const MIN_CHARACTERS_FOR_MID_FILE_START = 180;
 const MIN_OFFSET_FROM_BASE_START = 60;
 const MID_FILE_WINDOW_RATIO = 0.2;
 
-export async function getWorkspaceSource(): Promise<SourceContent | undefined> {
-	const workspaceSnippet = await getWorkspaceSnippet();
-	if (workspaceSnippet) {
-		return workspaceSnippet;
+const FALLBACK_MESSAGES = {
+	noWorkspace: 'Look Busy: no folder is open, so it loaded a built-in algorithm.',
+	noSupportedFiles: 'Look Busy: no supported files in this folder, so it loaded a built-in algorithm.',
+	allIgnored:
+		'Look Busy: every candidate file is excluded by .gitignore, so it loaded a built-in algorithm.',
+	noUsableBlock:
+		'Look Busy: no workspace file had a usable code block, so it loaded a built-in algorithm.',
+	workspaceDisabled:
+		'Look Busy is set to built-in algorithms only, so the workspace was not read.',
+};
+
+export async function getWorkspaceSource(options: SourceSelectionOptions = {}): Promise<SourceContent | undefined> {
+	if (options.token?.isCancellationRequested) {
+		return undefined;
 	}
 
-	const activeLanguageId = vscode.window.activeTextEditor?.document.languageId;
-	return getFallbackAlgorithmSource(activeLanguageId);
+	const preferWorkspace = options.preferWorkspace ?? true;
+
+	if (preferWorkspace) {
+		const workspaceSnippet = await getWorkspaceSnippet(options.token);
+		if (workspaceSnippet) {
+			return workspaceSnippet;
+		}
+
+		// getWorkspaceSnippet already reported why no workspace file qualified.
+		if (options.requireWorkspace) {
+			return undefined;
+		}
+	} else {
+		void vscode.window.showInformationMessage(FALLBACK_MESSAGES.workspaceDisabled);
+	}
+
+	return getFallbackAlgorithmSource(vscode.window.activeTextEditor?.document.languageId);
 }
 
 export function getFallbackAlgorithmSource(preferredLanguageId?: string): SourceContent {
-	let pack = preferredLanguageId
-		? LANGUAGE_SNIPPET_PACKS.find((p) => p.languageId === preferredLanguageId)
+	const preferredPack = preferredLanguageId
+		? LANGUAGE_SNIPPET_PACKS.find((pack) => pack.languageId === preferredLanguageId)
 		: undefined;
 
-	if (!pack) {
-		pack = LANGUAGE_SNIPPET_PACKS[Math.floor(Math.random() * LANGUAGE_SNIPPET_PACKS.length)];
-	}
+	const pack =
+		preferredPack ?? LANGUAGE_SNIPPET_PACKS[Math.floor(Math.random() * LANGUAGE_SNIPPET_PACKS.length)];
 
 	const snippet = pack.snippets[Math.floor(Math.random() * pack.snippets.length)];
-	const text = [
-		...snippet.prefixLines,
-		snippet.typedBlock,
-		...snippet.suffixLines,
-	].join('\n');
+	const text = [...snippet.prefixLines, snippet.typedBlock, ...snippet.suffixLines].join('\n');
 
-	const typingStart = snippet.prefixLines.length > 0
-		? snippet.prefixLines.join('\n').length + 1
-		: 0;
+	const typingStart =
+		snippet.prefixLines.length > 0 ? snippet.prefixLines.join('\n').length + 1 : 0;
 
 	return {
 		text,
@@ -264,70 +299,72 @@ export function inferLanguageFromPath(filePath: string): Pick<SourceContent, 'la
 	}
 }
 
-async function getWorkspaceSnippet(): Promise<SourceContent | undefined> {
-	if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
-		void vscode.window.showInformationMessage('No open workspace found. Loaded a classic algorithm snippet to look busy!');
+async function getWorkspaceSnippet(token?: vscode.CancellationToken): Promise<SourceContent | undefined> {
+	const folders = vscode.workspace.workspaceFolders;
+	if (!folders || folders.length === 0) {
+		void vscode.window.showInformationMessage(FALLBACK_MESSAGES.noWorkspace);
+		return undefined;
+	}
+
+	if (token?.isCancellationRequested) {
 		return undefined;
 	}
 
 	const include = `**/*.{${CANDIDATE_EXTENSIONS.join(',')}}`;
-	const exclude = '**/{node,node_modules,.git,.vscode,.idea,.venv,venv,env,dist,out,coverage,build,.next,.nuxt,.svelte-kit,.astro,target,bin,obj,vendor,.turbo,__pycache__,.pytest_cache,.mypy_cache,.tox,.pnpm-store,.yarn,.cache}/**';
-	const files = await vscode.workspace.findFiles(include, exclude, 2000);
+	const files = await vscode.workspace.findFiles(include, WORKSPACE_SEARCH_EXCLUDE, MAX_WORKSPACE_FILES);
 
 	if (files.length === 0) {
-		void vscode.window.showInformationMessage('No supported workspace files found. Loaded a classic algorithm snippet to look busy!');
+		void vscode.window.showInformationMessage(FALLBACK_MESSAGES.noSupportedFiles);
 		return undefined;
 	}
 
-	const gitignoreMatchers = await loadWorkspaceGitignoreMatchers();
+	const matchers = await loadWorkspaceGitignoreMatchers(token);
 	const activeUri = vscode.window.activeTextEditor?.document.uri;
-	if (
-		activeUri &&
-		isWorkspaceCandidateUri(activeUri) &&
-		!isUriInDefaultIgnoredDirectory(activeUri) &&
-		!isUriIgnoredByWorkspaceGitignore(activeUri, gitignoreMatchers)
-	) {
+
+	if (activeUri && isEligibleWorkspaceUri(activeUri, matchers)) {
 		const activeSource = await buildSourceFromFile(activeUri, { isActiveFile: true });
 		if (activeSource) {
 			return activeSource;
 		}
 	}
 
-	const eligibleFiles = files.filter(
-		(file) => !isUriInDefaultIgnoredDirectory(file) && !isUriIgnoredByWorkspaceGitignore(file, gitignoreMatchers)
-	);
+	const eligibleFiles = files.filter((file) => isEligibleWorkspaceUri(file, matchers));
 	if (eligibleFiles.length === 0) {
-		void vscode.window.showInformationMessage('All workspace files are excluded by .gitignore. Loaded a classic algorithm snippet to look busy!');
+		void vscode.window.showInformationMessage(FALLBACK_MESSAGES.allIgnored);
 		return undefined;
 	}
 
-	const prioritizedFiles = prioritizeWorkspaceFiles(eligibleFiles, activeUri);
-	for (const selectedFile of prioritizedFiles.slice(0, 200)) {
-		const source = await buildSourceFromFile(selectedFile, { isActiveFile: false });
+	const readableCandidates = prioritizeWorkspaceFiles(eligibleFiles, activeUri)
+		.slice(0, MAX_CANDIDATE_FILES)
+		.filter((file) => !isLowSignalWorkspaceFileName(file.fsPath));
+
+	for (const candidate of readableCandidates) {
+		if (token?.isCancellationRequested) {
+			return undefined;
+		}
+
+		const source = await buildSourceFromFile(candidate, { isActiveFile: false });
 		if (source) {
 			return source;
 		}
 	}
 
-	void vscode.window.showInformationMessage('Could not find a suitable workspace code block. Loaded a classic algorithm snippet to look busy!');
+	void vscode.window.showInformationMessage(FALLBACK_MESSAGES.noUsableBlock);
 	return undefined;
 }
 
 async function getFileContent(file: vscode.Uri): Promise<string | undefined> {
-	const openDoc = vscode.workspace.textDocuments.find(
-		(doc) => doc.uri.toString() === file.toString()
-	);
+	const openDoc = vscode.workspace.textDocuments.find((doc) => doc.uri.toString() === file.toString());
 	if (openDoc) {
-		const text = openDoc.getText();
-		if (text.length > 200_000) {
+		if (openDoc.getText().length > MAX_SOURCE_FILE_BYTES) {
 			return undefined;
 		}
-		return stripLeadingBom(text);
+		return stripLeadingBom(openDoc.getText());
 	}
 
 	try {
 		const bytes = await vscode.workspace.fs.readFile(file);
-		if (bytes.byteLength > 200_000) {
+		if (bytes.byteLength > MAX_SOURCE_FILE_BYTES) {
 			return undefined;
 		}
 		return stripLeadingBom(new TextDecoder('utf-8').decode(bytes));
@@ -340,19 +377,19 @@ async function buildSourceFromFile(
 	file: vscode.Uri,
 	options: SignalCheckOptions = {}
 ): Promise<SourceContent | undefined> {
-	const text = await getFileContent(file);
-	if (!text) {
+	if (isLowSignalWorkspaceFileName(file.fsPath)) {
 		return undefined;
 	}
 
-	if (isLowSignalWorkspaceFile(file, text, options)) {
+	const text = await getFileContent(file);
+	if (!text || hasLowSignalWorkspaceContent(text, file.fsPath, options)) {
 		return undefined;
 	}
 
 	const language = inferLanguageFromPath(file.fsPath);
 	const source = buildFullFileSource(text, language.languageId, language.extension);
 
-	if (source.typingEnd - source.typingStart < 40) {
+	if (source.typingEnd - source.typingStart < MIN_TYPABLE_CHARACTERS) {
 		return undefined;
 	}
 
@@ -389,6 +426,18 @@ function isWorkspaceCandidateUri(uri: vscode.Uri): boolean {
 	const extension = path.extname(uri.fsPath).toLowerCase();
 	const normalized = extension.startsWith('.') ? extension.slice(1) : extension;
 	return CANDIDATE_EXTENSIONS.includes(normalized);
+}
+
+function isEligibleWorkspaceUri(uri: vscode.Uri, matchers: GitignoreMatcher[]): boolean {
+	if (!isWorkspaceCandidateUri(uri)) {
+		return false;
+	}
+
+	if (isPathInDefaultIgnoredDirectory(uri.fsPath)) {
+		return false;
+	}
+
+	return !isUriIgnoredByWorkspaceGitignore(uri, matchers);
 }
 
 export function isPathInDefaultIgnoredDirectory(filePath: string): boolean {
@@ -452,52 +501,56 @@ export function scoreWorkspaceFilePath(filePath: string, activeFilePath: string 
 	return score;
 }
 
-async function loadWorkspaceGitignoreMatchers(): Promise<WorkspaceGitignoreMatcher[]> {
-	if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+async function loadWorkspaceGitignoreMatchers(token?: vscode.CancellationToken): Promise<GitignoreMatcher[]> {
+	const folders = vscode.workspace.workspaceFolders;
+	if (!folders || folders.length === 0) {
 		return [];
 	}
 
-	const matchers: WorkspaceGitignoreMatcher[] = [];
+	const matchers: GitignoreMatcher[] = [];
+	let gitignoreUris: vscode.Uri[] = [];
+
 	try {
-		const gitignoreUris = await vscode.workspace.findFiles(
+		gitignoreUris = await vscode.workspace.findFiles(
 			'**/.gitignore',
 			'**/{node_modules,.git,.venv,venv,dist,out,target,vendor}/**',
-			50
+			MAX_GITIGNORE_FILES
 		);
-
-		for (const gitignoreUri of gitignoreUris) {
-			const content = await readWorkspaceTextFile(gitignoreUri);
-			if (!content) {
-				continue;
-			}
-
-			const rules = parseGitignoreRules(content);
-			if (rules.length === 0) {
-				continue;
-			}
-
-			matchers.push({
-				folderUri: vscode.Uri.file(path.dirname(gitignoreUri.fsPath)),
-				rules,
-			});
-		}
 	} catch {
-		for (const folder of vscode.workspace.workspaceFolders) {
-			const gitignoreUri = vscode.Uri.joinPath(folder.uri, '.gitignore');
-			const content = await readWorkspaceTextFile(gitignoreUri);
-			if (!content) {
-				continue;
-			}
+		gitignoreUris = folders.map((folder) => vscode.Uri.joinPath(folder.uri, '.gitignore'));
+	}
 
-			const rules = parseGitignoreRules(content);
-			if (rules.length === 0) {
-				continue;
-			}
+	for (const gitignoreUri of gitignoreUris) {
+		if (token?.isCancellationRequested) {
+			break;
+		}
 
-			matchers.push({
-				folderUri: folder.uri,
-				rules,
-			});
+		const content = await readWorkspaceTextFile(gitignoreUri);
+		if (!content) {
+			continue;
+		}
+
+		const matcher = createGitignoreMatcher(path.dirname(gitignoreUri.fsPath), content);
+		if (matcher) {
+			matchers.push(matcher);
+		}
+	}
+
+	for (const folder of folders) {
+		if (token?.isCancellationRequested) {
+			break;
+		}
+
+		const excludeContent = await readWorkspaceTextFile(
+			vscode.Uri.joinPath(folder.uri, '.git', 'info', 'exclude')
+		);
+		if (!excludeContent) {
+			continue;
+		}
+
+		const matcher = createGitignoreMatcher(folder.uri.fsPath, excludeContent);
+		if (matcher) {
+			matchers.push(matcher);
 		}
 	}
 
@@ -513,51 +566,159 @@ async function readWorkspaceTextFile(uri: vscode.Uri): Promise<string | undefine
 	}
 }
 
+export function createGitignoreMatcher(rootPath: string, content: string): GitignoreMatcher | undefined {
+	const rules = parseGitignoreRules(content);
+	if (rules.length === 0) {
+		return undefined;
+	}
+
+	return { rootPath, rules };
+}
+
+/**
+ * Applies gitignore rules the way git does: the closest (deepest) directory that
+ * owns a rule for the path decides, so a negation in a nested .gitignore can
+ * override a rule from a parent one. The first matcher that produces any
+ * decision wins; matchers that never match the path are skipped.
+ */
+export function isPathIgnoredByGitignoreMatchers(filePath: string, matchers: GitignoreMatcher[]): boolean {
+	if (matchers.length === 0) {
+		return false;
+	}
+
+	const target = comparablePath(filePath);
+	const candidates = matchers
+		.filter((matcher) => isSameOrDescendantPath(comparablePath(matcher.rootPath), target))
+		.sort((left, right) => right.rootPath.length - left.rootPath.length);
+
+	for (const matcher of candidates) {
+		const relativePath = relativePathUnder(matcher.rootPath, filePath);
+		if (relativePath === undefined) {
+			continue;
+		}
+
+		const decision = evaluateGitignoreRules(relativePath, matcher.rules);
+		if (decision !== undefined) {
+			return decision;
+		}
+	}
+
+	return false;
+}
+
+function isSameOrDescendantPath(rootPath: string, targetPath: string): boolean {
+	if (rootPath.length === 0) {
+		return false;
+	}
+
+	return targetPath === rootPath || targetPath.startsWith(`${rootPath}/`);
+}
+
+function relativePathUnder(rootPath: string, filePath: string): string | undefined {
+	const root = comparablePath(rootPath);
+	const target = comparablePath(filePath);
+
+	if (target === root || !target.startsWith(`${root}/`)) {
+		return undefined;
+	}
+
+	return target.slice(root.length + 1);
+}
+
+function comparablePath(filePath: string): string {
+	const normalized = filePath.replace(/\\/g, '/').replace(/\/+$/, '');
+	return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
 export function parseGitignoreRules(content: string): GitignoreRule[] {
 	const lines = content.replace(/\r\n/g, '\n').split('\n');
 	const rules: GitignoreRule[] = [];
 
-	for (let rawLine of lines) {
-		if (!rawLine) {
-			continue;
-		}
-
-		rawLine = rawLine.trim();
-		if (rawLine.length === 0 || rawLine.startsWith('#')) {
+	for (const rawLine of lines) {
+		const line = stripUnescapedTrailingWhitespace(rawLine);
+		if (line.length === 0 || line[0] === '#') {
 			continue;
 		}
 
 		let negated = false;
-		if (rawLine.startsWith('!')) {
+		let pattern = line;
+
+		if (pattern[0] === '!') {
 			negated = true;
-			rawLine = rawLine.slice(1);
+			pattern = pattern.slice(1);
+		} else if (pattern[0] === '\\' && (pattern[1] === '!' || pattern[1] === '#')) {
+			pattern = pattern.slice(1);
 		}
 
-		const normalized = rawLine.replace(/\\/g, '/').replace(/^\.\/+/, '');
-		const compiled = compileGitignorePattern(normalized);
+		pattern = pattern.replace(/^\.\/+/, '');
+
+		const compiled = compileGitignorePattern(pattern);
 		if (!compiled) {
 			continue;
 		}
 
-		rules.push({
-			negated,
-			regex: compiled,
-		});
+		rules.push({ negated, regex: compiled });
 	}
 
 	return rules;
 }
 
 export function isRelativePathIgnoredByGitignore(relativePath: string, rules: GitignoreRule[]): boolean {
-	const normalizedPath = relativePath.replace(/\\/g, '/');
-	let ignored = false;
-	for (const rule of rules) {
-		if (rule.regex.test(normalizedPath)) {
-			ignored = !rule.negated;
+	return evaluateGitignoreRules(relativePath.replace(/\\/g, '/'), rules) === true;
+}
+
+/**
+ * Mirrors git: a pattern also matches every ancestor directory of the path, so
+ * an excluded directory excludes everything beneath it. Candidates are walked
+ * shallowest first so a deeper directory's rules get the last word.
+ *
+ * One deliberate deviation from git: a later negation can re-include a file
+ * whose parent directory matched an ignore rule, which git refuses to do.
+ */
+function evaluateGitignoreRules(relativePath: string, rules: GitignoreRule[]): boolean | undefined {
+	let ignored: boolean | undefined;
+
+	for (const candidate of ancestorPaths(relativePath)) {
+		for (const rule of rules) {
+			if (rule.regex.test(candidate)) {
+				ignored = !rule.negated;
+			}
 		}
 	}
 
 	return ignored;
+}
+
+function ancestorPaths(relativePath: string): string[] {
+	const segments = relativePath.split('/').filter((segment) => segment.length > 0);
+	const paths: string[] = [];
+	let current = '';
+
+	for (const segment of segments) {
+		current = current.length === 0 ? segment : `${current}/${segment}`;
+		paths.push(current);
+	}
+
+	return paths;
+}
+
+function stripUnescapedTrailingWhitespace(line: string): string {
+	let end = line.length;
+
+	while (end > 0) {
+		const character = line[end - 1];
+		if (character !== ' ' && character !== '\t') {
+			break;
+		}
+
+		if (end >= 2 && line[end - 2] === '\\') {
+			break;
+		}
+
+		end -= 1;
+	}
+
+	return line.slice(0, end);
 }
 
 function compileGitignorePattern(pattern: string): RegExp | undefined {
@@ -566,28 +727,55 @@ function compileGitignorePattern(pattern: string): RegExp | undefined {
 	}
 
 	const rooted = pattern.startsWith('/');
-	const directoryOnly = pattern.endsWith('/');
 	const cleaned = pattern.replace(/^\/+/, '').replace(/\/+$/, '');
 	if (!cleaned) {
 		return undefined;
 	}
 
-	const hasSlash = cleaned.includes('/');
 	const body = globToRegexBody(cleaned);
-	const prefix = rooted ? '^' : hasSlash ? '^(?:.*\\/)?' : '^(?:.*\\/)?';
-	const suffix = directoryOnly ? '(?:\\/.*)?$' : '$';
+	const prefix = rooted ? '^' : '^(?:.*\\/)?';
 	const flags = process.platform === 'win32' ? 'i' : '';
-	return new RegExp(`${prefix}${body}${suffix}`, flags);
+	return new RegExp(`${prefix}${body}$`, flags);
 }
 
+/**
+ * `**` is only special in three positions, exactly as git defines it: a leading
+ * globstar-slash (already covered by the any-depth prefix), an interior
+ * globstar-slash-globstar (zero or more directories), and a trailing
+ * globstar (everything inside). Anywhere else it degrades to `*` and must not
+ * cross a directory separator.
+ */
 function globToRegexBody(pattern: string): string {
 	let output = '';
+
 	for (let i = 0; i < pattern.length; i += 1) {
 		const character = pattern[i];
-		const next = pattern[i + 1];
 
-		if (character === '*' && next === '*') {
-			output += '.*';
+		if (character === '*' && pattern[i + 1] === '*') {
+			const isTrailing = i + 2 >= pattern.length;
+
+			if (isTrailing) {
+				i += 1;
+				if (output.endsWith('/')) {
+					output += '.*';
+				} else {
+					output += '[^/]*';
+				}
+				continue;
+			}
+
+			if (pattern[i + 2] === '/') {
+				i += 2;
+				if (output.length === 0) {
+					continue;
+				}
+
+				output = output.endsWith('/') ? output.slice(0, -1) : output;
+				output += '(?:\\/[^/]+)*\\/';
+				continue;
+			}
+
+			output += '[^/]*';
 			i += 1;
 			continue;
 		}
@@ -599,6 +787,27 @@ function globToRegexBody(pattern: string): string {
 
 		if (character === '?') {
 			output += '[^/]';
+			continue;
+		}
+
+		if (character === '[') {
+			const closingIndex = pattern.indexOf(']', i + 1);
+			if (closingIndex > i + 1) {
+				const classBody = pattern.slice(i + 1, closingIndex);
+				output += classBody[0] === '!' || classBody[0] === '^'
+					? `[${'^'}${classBody.slice(1)}]`
+					: `[${classBody}]`;
+				i = closingIndex;
+				continue;
+			}
+
+			output += '\\[';
+			continue;
+		}
+
+		if (character === '\\' && i + 1 < pattern.length) {
+			output += escapeRegexCharacter(pattern[i + 1]);
+			i += 1;
 			continue;
 		}
 
@@ -616,35 +825,12 @@ function escapeRegexCharacter(character: string): string {
 	return character;
 }
 
-function isUriIgnoredByWorkspaceGitignore(uri: vscode.Uri, matchers: WorkspaceGitignoreMatcher[]): boolean {
+function isUriIgnoredByWorkspaceGitignore(uri: vscode.Uri, matchers: GitignoreMatcher[]): boolean {
 	if (matchers.length === 0 || uri.scheme !== 'file') {
 		return false;
 	}
 
-	for (const matcher of matchers) {
-		if (matcher.rules.length === 0 || matcher.folderUri.scheme !== 'file') {
-			continue;
-		}
-
-		const relativePath = path.relative(matcher.folderUri.fsPath, uri.fsPath);
-		if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
-			continue;
-		}
-
-		if (isRelativePathIgnoredByGitignore(relativePath, matcher.rules)) {
-			return true;
-		}
-	}
-
-	return false;
-}
-
-function isUriInDefaultIgnoredDirectory(uri: vscode.Uri): boolean {
-	if (uri.scheme !== 'file') {
-		return false;
-	}
-
-	return isPathInDefaultIgnoredDirectory(uri.fsPath);
+	return isPathIgnoredByGitignoreMatchers(uri.fsPath, matchers);
 }
 
 export function stripLeadingBom(text: string): string {
@@ -848,12 +1034,13 @@ export function isLockOrMapFile(fileName: string): boolean {
 	return false;
 }
 
-export function isLowSignalWorkspaceFile(
-	file: vscode.Uri,
-	text: string,
-	options: SignalCheckOptions = {}
-): boolean {
-	const lowerName = path.basename(file.fsPath).toLowerCase();
+/**
+ * Filename-only rejection. Cheap enough to run against thousands of candidates
+ * before opening any of them.
+ */
+export function isLowSignalWorkspaceFileName(filePath: string): boolean {
+	const lowerName = path.basename(filePath).toLowerCase();
+
 	if (
 		lowerName.endsWith('.d.ts') ||
 		lowerName.endsWith('.min.js') ||
@@ -878,6 +1065,16 @@ export function isLowSignalWorkspaceFile(
 		return true;
 	}
 
+	return false;
+}
+
+/** Content-based rejection, applied only after a file has been read. */
+export function hasLowSignalWorkspaceContent(
+	text: string,
+	filePath: string,
+	options: SignalCheckOptions = {}
+): boolean {
+	const lowerName = path.basename(filePath).toLowerCase();
 	const normalized = text.replace(/\r\n/g, '\n');
 	const lines = normalized.split('\n');
 
@@ -902,6 +1099,18 @@ export function isLowSignalWorkspaceFile(
 	}
 
 	return false;
+}
+
+export function isLowSignalWorkspaceFile(
+	file: vscode.Uri,
+	text: string,
+	options: SignalCheckOptions = {}
+): boolean {
+	if (isLowSignalWorkspaceFileName(file.fsPath)) {
+		return true;
+	}
+
+	return hasLowSignalWorkspaceContent(text, file.fsPath, options);
 }
 
 function buildFullFileSource(text: string, languageId: string, extension: string): SourceContent {
@@ -953,3 +1162,5 @@ function isImportLikeLine(line: string): boolean {
 
 	return false;
 }
+
+export { MAX_SOURCE_FILE_BYTES };

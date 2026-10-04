@@ -10,7 +10,7 @@ Terrified your boss will replace you with an agent if they catch you scrolling r
 
 When an AI prompt takes time to run, spinning in your chair or checking your phone invites questions. Look Busy gives your hands something urgent to do:
 
-- **Uses your own code.** It pulls functions and classes directly from your active project.
+- **Uses your own code.** It pulls real code files directly from your active project, skipping past the imports.
 - **Ghost text guidance.** Upcoming code renders in muted ghost text. As you type, matching characters lock in and the cursor advances.
 - **Panic switch (`Esc`).** Hit escape at any moment. The mock document closes instantly with no save dialogs, leaving your workspace completely clean.
 - **Exit stats.** Every session calculates your typing speed and displays your WPM.

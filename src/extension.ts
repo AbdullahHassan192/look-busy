@@ -1,5 +1,8 @@
 import * as vscode from 'vscode';
 import { LookBusyController } from './lookBusyController';
+import { readSettings } from './settings';
+
+const ACTIVE_CONTEXT_KEY = 'lookBusy.active';
 
 export function activate(context: vscode.ExtensionContext) {
 	const controller = new LookBusyController();
@@ -8,21 +11,29 @@ export function activate(context: vscode.ExtensionContext) {
 	startStatusBarItem.tooltip = 'Start a Look Busy workspace session';
 	startStatusBarItem.command = 'look-busy.start';
 
-	const updateStatusBarVisibility = (sessionActive: boolean) => {
-		if (sessionActive) {
+	const updateStatusBarVisibility = () => {
+		if (controller.hasSession || !readSettings().showStatusBarButton) {
 			startStatusBarItem.hide();
 			return;
 		}
+
 		startStatusBarItem.show();
 	};
 
-	updateStatusBarVisibility(false);
+	updateStatusBarVisibility();
+	void vscode.commands.executeCommand('setContext', ACTIVE_CONTEXT_KEY, false);
 
 	context.subscriptions.push(
 		controller,
 		startStatusBarItem,
-		controller.onDidChangeSessionActive((sessionActive) => {
-			updateStatusBarVisibility(sessionActive);
+		controller.onDidChangeSessionActive(() => {
+			updateStatusBarVisibility();
+		}),
+		vscode.workspace.onDidChangeConfiguration((event) => {
+			if (event.affectsConfiguration('lookBusy')) {
+				controller.refreshSettings();
+				updateStatusBarVisibility();
+			}
 		}),
 		vscode.commands.registerCommand('look-busy.start', async () => {
 			await controller.start();

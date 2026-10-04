@@ -10,10 +10,8 @@ export interface LookBusyStats {
 	rawWpm: number;
 	accuracy: number;
 	totalKeystrokes: number;
-	correctKeystrokes: number;
 	errors: number;
 	backspaces: number;
-	elapsedMs: number;
 }
 
 export function calculateStats(
@@ -42,10 +40,8 @@ export function calculateStats(
 		rawWpm,
 		accuracy,
 		totalKeystrokes,
-		correctKeystrokes,
 		errors,
 		backspaces,
-		elapsedMs,
 	};
 }
 

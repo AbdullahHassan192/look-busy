@@ -2,31 +2,40 @@ import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { CharStatus, normalizeTypedText, SessionState, type CharStatusValue } from './sessionState';
 import { getWorkspaceSource, type SourceContent } from './sources';
+import { readSettings, type LookBusySettings } from './settings';
 import { calculateStats, getSnarkyComment } from './stats';
+import {
+	buildMaskedTargetText,
+	commonPrefixLength,
+	computeTextWindow,
+	type TextWindow,
+} from './textWindow';
 
 interface BusySession {
 	uri: vscode.Uri;
 	document: vscode.TextDocument;
 	editor: vscode.TextEditor;
-	target: string;
+	state: SessionState;
 	renderedText: string;
-	statuses: number[];
-	autoFilled: boolean[];
-	index: number;
-	typingStart: number;
-	typingEnd: number;
-	lineStarts: number[];
-	startedAt?: number;
-	lastKeystrokeAt?: number;
-	activeElapsedMs: number;
-	totalKeystrokes: number;
-	errorKeystrokes: number;
-	backspaceCount: number;
 	tempFilePath: string;
 }
 
 type SessionExitReason = 'completed' | 'panic' | 'documentClosed' | 'restarted' | 'disposed';
+
+const MIN_ELAPSED_MS = 1500;
+const STALE_TEMP_FILE_MS = 12 * 60 * 60 * 1000;
+const SAVE_DEBOUNCE_MS = 400;
+const SUGGEST_HIDE_THROTTLE_MS = 600;
+const ACTIVE_CONTEXT_KEY = 'lookBusy.active';
+
+const IME_COMPOSITION_COMMAND_IDS = [
+	'compositionStart',
+	'compositionType',
+	'compositionEnd',
+	'replacePreviousChar',
+] as const;
 
 export class LookBusyController implements vscode.Disposable {
 	private readonly untypedDecoration: vscode.TextEditorDecorationType;
@@ -37,10 +46,28 @@ export class LookBusyController implements vscode.Disposable {
 	private readonly sessionActiveEmitter = new vscode.EventEmitter<boolean>();
 	private readonly disposables: vscode.Disposable[] = [];
 	private session: BusySession | undefined;
+	private compositionDisposables: vscode.Disposable[] = [];
 	private isUpdatingSelection = false;
 	private isRevertingDocumentChange = false;
 	private isApplyingSessionText = false;
+	private isDisposed = false;
+	private isStarting = false;
+	private hasWarnedAboutIme = false;
+	private activeContextValue = false;
+	private lastSuggestHideAt = 0;
+	private saveTimer: NodeJS.Timeout | undefined;
+	private taskQueue: Promise<void> = Promise.resolve();
+	private settings: LookBusySettings = readSettings();
 	public readonly onDidChangeSessionActive = this.sessionActiveEmitter.event;
+
+	public get hasSession(): boolean {
+		return this.session !== undefined;
+	}
+
+	/** Lets the host observe configuration changes without re-reading on every keystroke. */
+	public refreshSettings(): void {
+		this.settings = readSettings();
+	}
 
 	public constructor() {
 		this.untypedDecoration = vscode.window.createTextEditorDecorationType({
@@ -79,44 +106,47 @@ export class LookBusyController implements vscode.Disposable {
 			this.sessionStatusBarItem,
 			this.sessionActiveEmitter,
 			vscode.window.onDidChangeTextEditorSelection((event) => {
-				if (!this.session || this.isUpdatingSelection) {
+				const session = this.session;
+				if (!session || this.isUpdatingSelection) {
 					return;
 				}
 
-				if (event.textEditor.document.uri.toString() !== this.session.uri.toString()) {
+				if (event.textEditor.document.uri.toString() !== session.uri.toString()) {
 					return;
 				}
 
-				this.applyCursor();
+				this.applyCursor(session);
+			}),
+			vscode.window.onDidChangeActiveTextEditor(() => {
+				this.syncEditorScopedState();
 			}),
 			vscode.workspace.onDidCloseTextDocument((document) => {
-				if (!this.session) {
+				const session = this.session;
+				if (!session || document.uri.toString() !== session.uri.toString()) {
 					return;
 				}
 
-				if (document.uri.toString() !== this.session.uri.toString()) {
-					return;
-				}
-
-				this.runSafely(this.finalizeSession('documentClosed', false));
+				this.runSafely(this.enqueue(() => this.finalizeSession('documentClosed', false)));
 			}),
 			vscode.window.tabGroups.onDidChangeTabs(() => {
-				if (!this.session) {
+				const session = this.session;
+				if (!session || this.hasOpenTabForUri(session.uri)) {
 					return;
 				}
 
-				if (this.hasOpenTabForUri(this.session.uri)) {
-					return;
-				}
-
-				this.runSafely(this.finalizeSession('documentClosed', false));
+				this.runSafely(this.enqueue(() => this.finalizeSession('documentClosed', false)));
 			}),
 			vscode.workspace.onDidChangeTextDocument((event) => {
-				if (!this.session || this.isRevertingDocumentChange || this.isApplyingSessionText) {
+				const session = this.session;
+				if (
+					!session ||
+					this.isRevertingDocumentChange ||
+					this.isApplyingSessionText
+				) {
 					return;
 				}
 
-				if (event.document.uri.toString() !== this.session.uri.toString()) {
+				if (event.document.uri.toString() !== session.uri.toString()) {
 					return;
 				}
 
@@ -124,29 +154,64 @@ export class LookBusyController implements vscode.Disposable {
 					return;
 				}
 
-				this.runSafely(this.revertUnexpectedDocumentChange());
+				this.runSafely(this.enqueue(() => this.revertUnexpectedDocumentChange(session)));
 			})
 		);
 	}
 
 	public async start(): Promise<void> {
-		if (this.session) {
-			await this.finalizeSession('restarted', true);
-		}
-
-		await this.pruneStaleTempFiles();
-
-		const source = await getWorkspaceSource();
-		if (!source) {
+		if (this.isDisposed || this.isStarting) {
 			return;
 		}
 
-		await this.beginSession(source);
+		this.isStarting = true;
+
+		try {
+			if (this.session) {
+				await this.enqueue(() => this.finalizeSession('restarted', true));
+			}
+
+			await this.pruneStaleTempFiles();
+
+			const { source } = this.settings;
+			let cancelled = false;
+
+			const resolved = await vscode.window.withProgress(
+				{
+					location: vscode.ProgressLocation.Notification,
+					title: 'Look Busy: scanning workspace',
+					cancellable: true,
+				},
+				async (_progress, token) => {
+					token.onCancellationRequested(() => {
+						cancelled = true;
+					});
+
+					const found = await getWorkspaceSource({
+						token,
+						preferWorkspace: source !== 'builtin',
+						requireWorkspace: source === 'workspace',
+					});
+
+					return cancelled ? undefined : found;
+				}
+			);
+
+			if (!resolved || this.isDisposed) {
+				return;
+			}
+
+			await this.enqueue(() => this.beginSession(resolved));
+		} catch (error) {
+			reportFailure('start a Look Busy session', error);
+		} finally {
+			this.isStarting = false;
+		}
 	}
 
 	public async routeType(text: string): Promise<void> {
 		if (this.shouldHandleSessionInput()) {
-			await this.consumeInput(text);
+			await this.enqueue(() => this.consumeInput(text));
 			return;
 		}
 
@@ -155,7 +220,7 @@ export class LookBusyController implements vscode.Disposable {
 
 	public async injectText(text: string): Promise<void> {
 		if (this.shouldHandleSessionInput()) {
-			await this.consumeInput(text);
+			await this.enqueue(() => this.consumeInput(text));
 			return;
 		}
 
@@ -165,91 +230,102 @@ export class LookBusyController implements vscode.Disposable {
 	}
 
 	public async blockEdit(action?: string): Promise<void> {
-		if (this.shouldHandleSessionInput()) {
-			if (action === 'backspace') {
-				await this.handleBackspace();
-				return;
-			}
-
-			await this.hideSuggestions();
+		if (!this.shouldHandleSessionInput()) {
+			return;
 		}
+
+		if (action === 'backspace') {
+			await this.enqueue(() => this.handleBackspace());
+			return;
+		}
+
+		await this.hideSuggestions(true);
 	}
 
 	public async panic(): Promise<void> {
-		await this.finalizeSession('panic', true);
+		await this.enqueue(() => this.finalizeSession('panic', true));
 	}
 
 	public dispose(): void {
-		void this.finalizeSession('disposed', false);
+		this.isDisposed = true;
+		this.clearPendingSave();
+		// finalizeSession clears session state synchronously before its first await,
+		// so decorations and the status bar item are still alive at that point.
+		this.runSafely(this.finalizeSession('disposed', false));
 		for (const disposable of this.disposables) {
 			disposable.dispose();
 		}
 	}
 
 	private async beginSession(source: SourceContent): Promise<void> {
-		const lineStarts = buildLineStarts(source.text);
-		const safeTypingStart = this.clampIndex(source.typingStart, source.text.length);
-		const safeTypingEnd = this.clampIndex(source.typingEnd, source.text.length);
-		const currentLine = findLineForIndex(safeTypingStart, lineStarts);
-		const initialWindowEndLine = Math.min(currentLine + 1, lineStarts.length - 1);
-		const initialEnd = lineStarts[initialWindowEndLine] ?? source.text.length;
-		const initialRenderedText = buildMaskedTargetText(source.text, initialEnd);
+		const state = new SessionState(source.text, source.typingStart, source.typingEnd);
+		const initialWindow = computeTextWindow(
+			state.target,
+			state.lineStarts,
+			state.index,
+			this.settings.ghostLinesAhead
+		);
 
-		const { uri, tempFilePath } = await this.createTempDocument(source, initialRenderedText);
-		let document = await vscode.workspace.openTextDocument(uri);
+		const { uri, tempFilePath } = await this.createTempDocument(
+			source,
+			buildMaskedTargetText(state.target, initialWindow.end)
+		);
 
-		if (document.languageId !== source.languageId) {
-			document = await vscode.languages.setTextDocumentLanguage(document, source.languageId);
+		try {
+			let document = await vscode.workspace.openTextDocument(uri);
+			if (document.languageId !== source.languageId) {
+				document = await vscode.languages.setTextDocumentLanguage(document, source.languageId);
+			}
+
+			const editor = await vscode.window.showTextDocument(document, {
+				preview: false,
+				preserveFocus: false,
+				viewColumn: vscode.ViewColumn.Active,
+			});
+
+			this.session = {
+				uri: document.uri,
+				document,
+				editor,
+				state,
+				renderedText: buildMaskedTargetText(state.target, initialWindow.end),
+				tempFilePath,
+			};
+
+			this.hasWarnedAboutIme = false;
+			this.syncEditorScopedState();
+			this.applyDecorations(this.session);
+			this.applyCursor(this.session);
+			await this.hideSuggestions(true);
+
+			this.sessionStatusBarItem.text = '$(pulse) Looking Busy: Ready';
+			this.sessionStatusBarItem.show();
+
+			if (!this.isDisposed) {
+				this.sessionActiveEmitter.fire(true);
+			}
+		} catch (error) {
+			await this.cleanupFailedSessionStart(uri, tempFilePath);
+			reportFailure('open the Look Busy session document', error);
+			void vscode.window.showErrorMessage(
+				'Look Busy could not open a session document. Check the Look Busy output for details.'
+			);
+		}
+	}
+
+	private async cleanupFailedSessionStart(uri: vscode.Uri, tempFilePath: string): Promise<void> {
+		if (this.session?.uri.toString() === uri.toString()) {
+			this.clearSessionDecorations(this.session);
+			this.session = undefined;
 		}
 
-		const editor = await vscode.window.showTextDocument(document, {
-			preview: false,
-			preserveFocus: false,
-			viewColumn: vscode.ViewColumn.Active,
-		});
-
-		this.session = {
-			uri: document.uri,
-			document,
-			editor,
-			target: source.text,
-			renderedText: initialRenderedText,
-			statuses: Array.from({ length: source.text.length }, () => 0),
-			autoFilled: Array.from({ length: source.text.length }, () => false),
-			index: safeTypingStart,
-			typingStart: safeTypingStart,
-			typingEnd: safeTypingEnd,
-			lineStarts,
-			tempFilePath,
-			activeElapsedMs: 0,
-			totalKeystrokes: 0,
-			errorKeystrokes: 0,
-			backspaceCount: 0,
-		};
-
-		for (let i = 0; i < this.session.typingStart; i += 1) {
-			this.session.statuses[i] = 1;
-		}
-
-		for (let i = this.session.typingEnd; i < this.session.statuses.length; i += 1) {
-			this.session.statuses[i] = 1;
-		}
-
-		this.applyAutomaticIndentation();
-		await this.synchronizeSessionDocument();
-
-		await vscode.commands.executeCommand('setContext', 'lookBusy.active', true);
-		this.sessionActiveEmitter.fire(true);
-		this.applyDecorations();
-		this.applyCursor();
-		await this.hideSuggestions();
-
-		this.sessionStatusBarItem.text = '$(pulse) Looking Busy: Ready';
-		this.sessionStatusBarItem.show();
+		await this.closeEditorForUri(uri).catch(() => undefined);
+		await fs.unlink(tempFilePath).catch(() => undefined);
 	}
 
 	private shouldHandleSessionInput(): boolean {
-		if (!this.session) {
+		const session = this.session;
+		if (!session) {
 			return false;
 		}
 
@@ -258,221 +334,198 @@ export class LookBusyController implements vscode.Disposable {
 			return false;
 		}
 
-		return activeEditor.document.uri.toString() === this.session.uri.toString();
+		return activeEditor.document.uri.toString() === session.uri.toString();
 	}
 
-	private recordKeystroke(): void {
-		if (!this.session) {
+	/**
+	 * Keeps editor-scoped state in step with which editor has focus.
+	 *
+	 * The `lookBusy.active` context key gates the contributed keybindings, so it
+	 * must only be true while the session document has focus. Leaving it true
+	 * would bind Escape, Enter, Backspace, paste, cut, undo and redo to Look Busy
+	 * handlers in every other editor, silently swallowing those keys.
+	 */
+	private syncEditorScopedState(): void {
+		const focused = this.shouldHandleSessionInput();
+		void this.setActiveContext(focused);
+
+		if (focused) {
+			this.registerCompositionHandlers();
+		} else {
+			this.disposeCompositionHandlers();
+		}
+	}
+
+	private async setActiveContext(value: boolean): Promise<void> {
+		if (this.activeContextValue === value) {
 			return;
 		}
 
-		const now = Date.now();
-		if (this.session.startedAt === undefined) {
-			this.session.startedAt = now;
-			this.session.lastKeystrokeAt = now;
-			this.session.activeElapsedMs = 0;
+		this.activeContextValue = value;
+		await vscode.commands
+			.executeCommand('setContext', ACTIVE_CONTEXT_KEY, value)
+			.then(undefined, () => undefined);
+	}
+
+	/**
+	 * IME composition bypasses the `type` command entirely, so without these
+	 * handlers a composed character would write straight into the session
+	 * document and then be reverted by the change listener. They are registered
+	 * only while the session editor has focus, so input methods keep working
+	 * normally everywhere else.
+	 */
+	private registerCompositionHandlers(): void {
+		if (this.compositionDisposables.length > 0) {
 			return;
 		}
 
-		if (this.session.lastKeystrokeAt !== undefined) {
-			const delta = now - this.session.lastKeystrokeAt;
-			const maxIdlePauseMs = 2500;
-			this.session.activeElapsedMs += Math.min(delta, maxIdlePauseMs);
-			this.session.lastKeystrokeAt = now;
-		}
+		this.compositionDisposables = IME_COMPOSITION_COMMAND_IDS.map((commandId) =>
+			vscode.commands.registerCommand(commandId, (args: unknown) => {
+				this.handleCompositionInput(extractCompositionText(args));
+			})
+		);
 	}
 
-	private calculateSessionActiveElapsed(session: BusySession): number {
-		if (session.startedAt === undefined || session.lastKeystrokeAt === undefined) {
-			return 0;
+	private disposeCompositionHandlers(): void {
+		for (const disposable of this.compositionDisposables) {
+			disposable.dispose();
 		}
 
-		const trailingDelta = Date.now() - session.lastKeystrokeAt;
-		const maxTrailingMs = 1000;
-		return session.activeElapsedMs + Math.min(trailingDelta, maxTrailingMs);
+		this.compositionDisposables = [];
 	}
 
-	private updateLiveStatusBar(): void {
-		if (!this.session) {
-			this.sessionStatusBarItem.hide();
+	private handleCompositionInput(text: string): void {
+		if (text.length === 0 || !this.shouldHandleSessionInput()) {
 			return;
 		}
 
-		const charsTyped = this.countTypedSessionCharacters(this.session);
-		if (charsTyped === 0 || this.session.startedAt === undefined) {
+		if (!this.hasWarnedAboutIme) {
+			this.hasWarnedAboutIme = true;
+			void vscode.window.showInformationMessage(
+				'Look Busy: input method composition is matched against the target text, so accuracy may drop.'
+			);
+		}
+
+		this.runSafely(this.enqueue(() => this.consumeInput(text)));
+	}
+
+	private async consumeInput(text: string): Promise<void> {
+		const session = this.session;
+		if (!session || text.length === 0) {
+			return;
+		}
+
+		const normalizedText = normalizeTypedText(text);
+		await this.hideSuggestions(/[\n\t]/.test(normalizedText));
+		if (this.session !== session) {
+			return;
+		}
+
+		session.state.consume(normalizedText);
+
+		await this.synchronizeSessionDocument(session);
+		if (this.session !== session) {
+			return;
+		}
+
+		this.applyDecorations(session);
+		this.applyCursor(session);
+		this.updateLiveStatusBar(session);
+
+		if (session.state.isComplete) {
+			await this.finalizeSession('completed', true);
+		}
+	}
+
+	private async handleBackspace(): Promise<void> {
+		const session = this.session;
+		if (!session) {
+			return;
+		}
+
+		session.state.backspace();
+
+		await this.synchronizeSessionDocument(session);
+		if (this.session !== session) {
+			return;
+		}
+
+		this.applyDecorations(session);
+		this.applyCursor(session);
+		await this.hideSuggestions(true);
+		this.updateLiveStatusBar(session);
+	}
+
+	private updateLiveStatusBar(session: BusySession): void {
+		const { state } = session;
+
+		if (!state.hasTypedAnything || !state.hasRecordedKeystrokes) {
 			this.sessionStatusBarItem.text = '$(pulse) Looking Busy: Ready';
 			return;
 		}
 
-		const activeElapsedMs = this.calculateSessionActiveElapsed(this.session);
-		const stats = calculateStats(charsTyped, activeElapsedMs, {
-			totalKeystrokes: this.session.totalKeystrokes,
-			errors: this.session.errorKeystrokes,
-			backspaces: this.session.backspaceCount,
-			minElapsedMs: 1500,
+		const stats = calculateStats(state.typedCharacters, state.activeElapsedMs, {
+			totalKeystrokes: state.totalKeystrokes,
+			errors: state.errorKeystrokes,
+			backspaces: state.backspaceCount,
+			minElapsedMs: MIN_ELAPSED_MS,
 		});
 
 		this.sessionStatusBarItem.text = `$(pulse) Looking Busy: ${stats.wpm.toFixed(0)} WPM (${stats.accuracy}%)`;
 	}
 
-	private async consumeInput(text: string): Promise<void> {
-		if (!this.session || text.length === 0) {
-			return;
-		}
-
-		await this.hideSuggestions();
-
-		const normalizedText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-
-		for (const character of Array.from(normalizedText)) {
-			if (this.session.index >= this.session.typingEnd) {
-				break;
-			}
-
-			this.recordKeystroke();
-			this.session.totalKeystrokes += 1;
-
-			const expected = this.session.target[this.session.index];
-			if (character === expected) {
-				this.session.statuses[this.session.index] = 1;
-				this.session.autoFilled[this.session.index] = false;
-				this.session.index += 1;
-				this.applyAutomaticIndentation();
-				continue;
-			}
-
-			const tabEquivalentLength = this.consumeTabEquivalentIndentation(character);
-			if (tabEquivalentLength > 0) {
-				this.session.statuses[this.session.index] = 1;
-				this.session.autoFilled[this.session.index] = false;
-				for (let i = 1; i < tabEquivalentLength; i += 1) {
-					this.session.statuses[this.session.index + i] = 1;
-					this.session.autoFilled[this.session.index + i] = true;
-				}
-				this.session.index += tabEquivalentLength;
-				this.applyAutomaticIndentation();
-				continue;
-			}
-
-			if (character === '\t') {
-				// Absorb tab when not expecting indentation, preserving alignment
-				continue;
-			}
-
-			// Wrong character typed: mark as error, but do NOT advance index
-			this.session.errorKeystrokes += 1;
-			this.session.statuses[this.session.index] = 2;
-			this.session.autoFilled[this.session.index] = false;
-		}
-
-		await this.synchronizeSessionDocument();
-		this.applyDecorations();
-		this.applyCursor();
-		this.updateLiveStatusBar();
-
-		if (this.session.index >= this.session.typingEnd) {
-			await this.completeSession();
-		}
-	}
-
-	private async handleBackspace(): Promise<void> {
-		if (!this.session) {
-			return;
-		}
-
-		this.recordKeystroke();
-		this.session.backspaceCount += 1;
-		this.session.totalKeystrokes += 1;
-
-		if (this.session.index <= this.session.typingStart) {
-			this.updateLiveStatusBar();
-			return;
-		}
-
-		// If current character has an uncorrected error, clear it without moving back
-		if (this.session.index < this.session.typingEnd && this.session.statuses[this.session.index] === 2) {
-			this.session.statuses[this.session.index] = 0;
-			await this.synchronizeSessionDocument();
-			this.applyDecorations();
-			this.applyCursor();
-			await this.hideSuggestions();
-			this.updateLiveStatusBar();
-			return;
-		}
-
-		// Roll back preceding auto-filled indentation if any
-		while (
-			this.session.index > this.session.typingStart &&
-			this.session.autoFilled[this.session.index - 1]
-		) {
-			this.session.index -= 1;
-			this.session.statuses[this.session.index] = 0;
-			this.session.autoFilled[this.session.index] = false;
-		}
-
-		if (this.session.index > this.session.typingStart) {
-			this.session.index -= 1;
-			this.session.statuses[this.session.index] = 0;
-			this.session.autoFilled[this.session.index] = false;
-		}
-
-		await this.synchronizeSessionDocument();
-		this.applyDecorations();
-		this.applyCursor();
-		await this.hideSuggestions();
-		this.updateLiveStatusBar();
-	}
-
-	private applyDecorations(): void {
-		if (!this.session) {
-			return;
-		}
-
-		const window = this.getVisibleWindow();
-		const untypedRanges = this.collectRangesForStatus(0, window.start, window.end);
-		const wrongRanges = this.collectRangesForStatus(2, window.start, window.end);
-		this.session.editor.setDecorations(this.untypedDecoration, untypedRanges);
-		this.session.editor.setDecorations(this.wrongDecoration, wrongRanges);
+	private applyDecorations(session: BusySession): void {
+		const window = this.getSessionWindow(session);
+		session.editor.setDecorations(
+			this.untypedDecoration,
+			this.collectRangesForStatus(session, CharStatus.Untyped, window)
+		);
+		session.editor.setDecorations(
+			this.wrongDecoration,
+			this.collectRangesForStatus(session, CharStatus.Error, window)
+		);
 
 		const emptyLineHints: vscode.Range[] = [];
 		const eolHints: vscode.Range[] = [];
+		const { state } = session;
 
-		if (this.session.index < this.session.typingEnd && this.session.target[this.session.index] === '\n') {
-			const pos = this.session.document.positionAt(this.session.index);
-			const lineStart = this.session.target.lastIndexOf('\n', this.session.index - 1) + 1;
-			const lineContentBefore = this.session.target.slice(lineStart, this.session.index);
+		if (state.index < state.typingEnd && state.target[state.index] === '\n') {
+			const position = session.document.positionAt(state.index);
+			const lineStart = state.target.lastIndexOf('\n', state.index - 1) + 1;
+			const lineContentBefore = state.target.slice(lineStart, state.index);
+
 			if (lineContentBefore.trim().length === 0) {
-				emptyLineHints.push(new vscode.Range(pos, pos));
+				emptyLineHints.push(new vscode.Range(position, position));
 			} else {
-				eolHints.push(new vscode.Range(pos, pos));
+				eolHints.push(new vscode.Range(position, position));
 			}
 		}
 
-		this.session.editor.setDecorations(this.emptyLineHintDecoration, emptyLineHints);
-		this.session.editor.setDecorations(this.eolHintDecoration, eolHints);
+		session.editor.setDecorations(this.emptyLineHintDecoration, emptyLineHints);
+		session.editor.setDecorations(this.eolHintDecoration, eolHints);
 	}
 
-	private collectRangesForStatus(status: number, start: number, end: number): vscode.Range[] {
-		if (!this.session) {
-			return [];
-		}
-
+	private collectRangesForStatus(
+		session: BusySession,
+		status: CharStatusValue,
+		window: TextWindow
+	): vscode.Range[] {
 		const ranges: vscode.Range[] = [];
-		const statuses = this.session.statuses;
+		const { state } = session;
 		let startIndex = -1;
 
-		for (let i = start; i < end; i += 1) {
-			const match = statuses[i] === status;
+		for (let i = window.start; i < window.end; i += 1) {
+			const matches = state.statusAt(i) === status;
 
-			if (match && startIndex === -1) {
+			if (matches && startIndex === -1) {
 				startIndex = i;
 			}
 
-			if (!match && startIndex !== -1) {
+			if (!matches && startIndex !== -1) {
 				ranges.push(
 					new vscode.Range(
-						this.session.document.positionAt(startIndex),
-						this.session.document.positionAt(i)
+						session.document.positionAt(startIndex),
+						session.document.positionAt(i)
 					)
 				);
 				startIndex = -1;
@@ -482,8 +535,8 @@ export class LookBusyController implements vscode.Disposable {
 		if (startIndex !== -1) {
 			ranges.push(
 				new vscode.Range(
-					this.session.document.positionAt(startIndex),
-					this.session.document.positionAt(end)
+					session.document.positionAt(startIndex),
+					session.document.positionAt(window.end)
 				)
 			);
 		}
@@ -491,60 +544,75 @@ export class LookBusyController implements vscode.Disposable {
 		return ranges;
 	}
 
-	private applyCursor(): void {
-		if (!this.session) {
-			return;
-		}
-
-		const position = this.session.document.positionAt(this.session.index);
+	private applyCursor(session: BusySession): void {
+		const position = session.document.positionAt(session.state.index);
 		const selection = new vscode.Selection(position, position);
 
 		this.isUpdatingSelection = true;
-		this.session.editor.selection = selection;
-		this.session.editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+		session.editor.selection = selection;
+		session.editor.revealRange(
+			new vscode.Range(position, position),
+			vscode.TextEditorRevealType.InCenterIfOutsideViewport
+		);
 		this.isUpdatingSelection = false;
 	}
 
-	private async completeSession(): Promise<void> {
-		if (!this.session) {
-			return;
-		}
+	private getSessionWindow(session: BusySession): TextWindow {
+		return computeTextWindow(
+			session.state.target,
+			session.state.lineStarts,
+			session.state.index,
+			this.settings.ghostLinesAhead
+		);
+	}
 
-		await this.finalizeSession('completed', true);
+	private clearSessionDecorations(session: BusySession): void {
+		session.editor.setDecorations(this.untypedDecoration, []);
+		session.editor.setDecorations(this.wrongDecoration, []);
+		session.editor.setDecorations(this.emptyLineHintDecoration, []);
+		session.editor.setDecorations(this.eolHintDecoration, []);
 	}
 
 	private async finalizeSession(reason: SessionExitReason, closeEditor: boolean): Promise<void> {
-		if (!this.session) {
-			this.sessionStatusBarItem.hide();
-			await vscode.commands.executeCommand('setContext', 'lookBusy.active', false);
+		const session = this.session;
+		this.session = undefined;
+
+		this.disposeCompositionHandlers();
+		this.clearPendingSave();
+
+		if (session) {
+			this.clearSessionDecorations(session);
+		}
+
+		this.sessionStatusBarItem.hide();
+		void this.setActiveContext(false);
+
+		if (!this.isDisposed) {
 			this.sessionActiveEmitter.fire(false);
+		}
+
+		if (!session) {
 			return;
 		}
 
-		const previousSession = this.session;
-		this.session = undefined;
-		this.sessionStatusBarItem.hide();
-		await vscode.commands.executeCommand('setContext', 'lookBusy.active', false);
-		this.sessionActiveEmitter.fire(false);
-
-		previousSession.editor.setDecorations(this.untypedDecoration, []);
-		previousSession.editor.setDecorations(this.wrongDecoration, []);
-		previousSession.editor.setDecorations(this.emptyLineHintDecoration, []);
-		previousSession.editor.setDecorations(this.eolHintDecoration, []);
-
 		if (closeEditor) {
-			await this.closeSessionEditorWithoutSavePrompt(previousSession);
+			try {
+				await this.closeSessionEditorWithoutSavePrompt(session);
+			} catch (error) {
+				reportFailure('close the Look Busy session document', error);
+			}
 		}
 
-		await fs.unlink(previousSession.tempFilePath).catch(() => undefined);
-		if (reason !== 'disposed') {
-			this.showSessionExitStats(previousSession, reason);
+		await fs.unlink(session.tempFilePath).catch(() => undefined);
+
+		if (reason !== 'disposed' && !this.isDisposed) {
+			this.showSessionExitStats(session, reason);
 		}
 	}
 
 	private async closeEditorForUri(uri: vscode.Uri): Promise<void> {
-		const toClose: vscode.Tab[] = [];
 		const uriText = uri.toString();
+		const toClose: vscode.Tab[] = [];
 
 		for (const group of vscode.window.tabGroups.all) {
 			for (const tab of group.tabs) {
@@ -581,6 +649,7 @@ export class LookBusyController implements vscode.Disposable {
 	}
 
 	private async closeSessionEditorWithoutSavePrompt(session: BusySession): Promise<void> {
+		this.clearPendingSave();
 		const saved = await session.document.save();
 		if (saved) {
 			await this.closeEditorForUri(session.uri);
@@ -595,7 +664,10 @@ export class LookBusyController implements vscode.Disposable {
 		await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
 	}
 
-	private async createTempDocument(source: SourceContent, initialText: string): Promise<{ uri: vscode.Uri; tempFilePath: string }> {
+	private async createTempDocument(
+		source: SourceContent,
+		initialText: string
+	): Promise<{ uri: vscode.Uri; tempFilePath: string }> {
 		const tempDir = path.join(os.tmpdir(), 'look-busy');
 		await fs.mkdir(tempDir, { recursive: true });
 
@@ -605,188 +677,166 @@ export class LookBusyController implements vscode.Disposable {
 
 		await fs.writeFile(tempFilePath, initialText, 'utf8');
 
-		const uri = vscode.Uri.file(tempFilePath);
 		return {
-			uri,
+			uri: vscode.Uri.file(tempFilePath),
 			tempFilePath,
 		};
 	}
 
 	private async pruneStaleTempFiles(): Promise<void> {
 		const tempDir = path.join(os.tmpdir(), 'look-busy');
-		const staleThresholdMs = 12 * 60 * 60 * 1000;
+		await fs.mkdir(tempDir, { recursive: true });
+
+		const entries = await fs.readdir(tempDir, { withFileTypes: true });
 		const now = Date.now();
 
-		await fs.mkdir(tempDir, { recursive: true });
-		const entries = await fs.readdir(tempDir, { withFileTypes: true });
-
-		const cleanupTasks: Promise<void>[] = [];
-		for (const entry of entries) {
-			if (!entry.isFile() || !entry.name.startsWith('look-busy-')) {
-				continue;
-			}
-
-			const tempFilePath = path.join(tempDir, entry.name);
-			const task = fs.stat(tempFilePath)
-				.then((stats) => {
-					if (now - stats.mtimeMs < staleThresholdMs) {
-						return;
-					}
-					return fs.unlink(tempFilePath).then(undefined, () => undefined);
-				})
-				.then(() => undefined, () => undefined);
-			cleanupTasks.push(task);
-		}
+		const cleanupTasks = entries
+			.filter((entry) => entry.isFile() && entry.name.startsWith('look-busy-'))
+			.map((entry) => {
+				const tempFilePath = path.join(tempDir, entry.name);
+				return fs
+					.stat(tempFilePath)
+					.then((stats) =>
+						now - stats.mtimeMs < STALE_TEMP_FILE_MS ? undefined : fs.unlink(tempFilePath)
+					)
+					.then(undefined, () => undefined);
+			});
 
 		await Promise.all(cleanupTasks);
 	}
 
-	private async hideSuggestions(): Promise<void> {
+	/**
+	 * Hiding the suggest widget costs two command round trips, so it is throttled
+	 * for ordinary characters and only forced for input that could accept a
+	 * suggestion (newline, tab) or that follows an edit.
+	 */
+	private async hideSuggestions(force: boolean): Promise<void> {
+		const now = Date.now();
+		if (!force && now - this.lastSuggestHideAt < SUGGEST_HIDE_THROTTLE_MS) {
+			return;
+		}
+
+		this.lastSuggestHideAt = now;
 		await vscode.commands.executeCommand('hideSuggestWidget').then(undefined, () => undefined);
-		await vscode.commands.executeCommand('editor.action.inlineSuggest.hide').then(undefined, () => undefined);
+		await vscode.commands
+			.executeCommand('editor.action.inlineSuggest.hide')
+			.then(undefined, () => undefined);
 	}
 
-	private applyAutomaticIndentation(): void {
-		if (!this.session) {
-			return;
-		}
-
-		const { target, typingEnd } = this.session;
-		const atLineStart = this.session.index === 0 || target[this.session.index - 1] === '\n';
-		if (!atLineStart) {
-			return;
-		}
-
-		while (this.session.index < typingEnd) {
-			const character = target[this.session.index];
-			if (character !== ' ' && character !== '\t') {
-				break;
-			}
-
-			this.session.statuses[this.session.index] = 1;
-			this.session.autoFilled[this.session.index] = true;
-			this.session.index += 1;
-		}
-	}
-
-	private getVisibleWindow(): { start: number; end: number } {
-		if (!this.session) {
-			return { start: 0, end: 0 };
-		}
-
-		const currentLine = findLineForIndex(this.session.index, this.session.lineStarts);
-		const windowStart = 0;
-		const windowEndLine = Math.min(currentLine + 1, this.session.lineStarts.length - 1);
-		const windowEnd = this.session.lineStarts[windowEndLine] ?? this.session.target.length;
-
-		return {
-			start: windowStart,
-			end: Math.max(windowStart, windowEnd),
-		};
-	}
-
-	private clampIndex(index: number, length: number): number {
-		if (index < 0) {
-			return 0;
-		}
-
-		if (index > length) {
-			return length;
-		}
-
-		return index;
-	}
-
-	private runSafely(task: Promise<void>): void {
-		void task.catch((error) => {
-			console.error('Look Busy session task failed.', error);
-		});
-	}
-
-	private countTypedSessionCharacters(session: BusySession): number {
-		let typed = 0;
-		for (let i = session.typingStart; i < session.typingEnd; i += 1) {
-			if (session.statuses[i] === 1 && !session.autoFilled[i]) {
-				typed += 1;
-			}
-		}
-
-		return typed;
-	}
-
-	private consumeTabEquivalentIndentation(inputCharacter: string): number {
-		if (!this.session || inputCharacter !== '\t') {
-			return 0;
-		}
-
-		const { target, index, typingEnd } = this.session;
-		return getTabEquivalentIndentationLength(target, index, typingEnd);
-	}
-
-	private async revertUnexpectedDocumentChange(): Promise<void> {
-		this.isRevertingDocumentChange = true;
-		try {
-			await this.hideSuggestions();
-			await this.synchronizeSessionDocument();
-			this.applyDecorations();
-			this.applyCursor();
-		} finally {
-			this.isRevertingDocumentChange = false;
-		}
-	}
-
-	private async synchronizeSessionDocument(): Promise<void> {
-		if (!this.session) {
-			return;
-		}
-
-		const window = this.getVisibleWindow();
-		const nextRenderedText = buildMaskedTargetText(this.session.target, window.end);
-		if (nextRenderedText === this.session.renderedText) {
+	/**
+	 * Keeps the session document in step with the state machine.
+	 *
+	 * The rendered text is always a prefix of the target, so only the tail after
+	 * the common prefix is replaced. Advancing a line appends one line instead of
+	 * rewriting the whole document, which keeps re-tokenisation and the range
+	 * bookkeeping proportional to what actually changed.
+	 */
+	private async synchronizeSessionDocument(session: BusySession): Promise<void> {
+		const window = this.getSessionWindow(session);
+		const nextRenderedText = buildMaskedTargetText(session.state.target, window.end);
+		if (nextRenderedText === session.renderedText) {
 			return;
 		}
 
 		const edit = new vscode.WorkspaceEdit();
+		const changedFrom = commonPrefixLength(session.renderedText, nextRenderedText);
 		edit.replace(
-			this.session.uri,
+			session.uri,
 			new vscode.Range(
-				this.session.document.positionAt(0),
-				this.session.document.positionAt(this.session.document.getText().length)
+				session.document.positionAt(changedFrom),
+				getDocumentEndPosition(session.document)
 			),
-			nextRenderedText
+			nextRenderedText.slice(changedFrom)
 		);
 
 		this.isApplyingSessionText = true;
 		try {
 			const applied = await vscode.workspace.applyEdit(edit);
 			if (!applied) {
-				throw new Error('Failed to synchronize Look Busy session text.');
+				throw new Error('Failed to apply the Look Busy session text update.');
 			}
-			this.session.renderedText = nextRenderedText;
-			const saved = await this.session.document.save();
-			if (!saved) {
-				throw new Error('Failed to save Look Busy temp session document.');
-			}
+
+			session.renderedText = nextRenderedText;
+			this.queuePendingSave(session);
 		} finally {
 			this.isApplyingSessionText = false;
 		}
 	}
 
+	private queuePendingSave(session: BusySession): void {
+		if (this.saveTimer || this.isDisposed) {
+			return;
+		}
+
+		this.saveTimer = setTimeout(() => {
+			this.saveTimer = undefined;
+			this.runSafely(this.flushPendingSave(session));
+		}, SAVE_DEBOUNCE_MS);
+	}
+
+	private async flushPendingSave(session: BusySession): Promise<void> {
+		this.clearPendingSave();
+		if (this.isDisposed) {
+			return;
+		}
+
+		if (!session.document.isDirty) {
+			return;
+		}
+
+		await session.document.save().then(undefined, () => undefined);
+	}
+
+	private clearPendingSave(): void {
+		if (this.saveTimer) {
+			clearTimeout(this.saveTimer);
+			this.saveTimer = undefined;
+		}
+	}
+
+	private async revertUnexpectedDocumentChange(session: BusySession): Promise<void> {
+		this.isRevertingDocumentChange = true;
+		try {
+			// Force a full replacement: the document no longer matches what we rendered.
+			session.renderedText = '';
+			await this.hideSuggestions(true);
+			await this.synchronizeSessionDocument(session);
+			if (this.session !== session) {
+				return;
+			}
+
+			this.applyDecorations(session);
+			this.applyCursor(session);
+		} finally {
+			this.isRevertingDocumentChange = false;
+		}
+	}
+
+	/**
+	 * Serialises every state mutation. Two overlapping keystroke handlers could
+	 * otherwise interleave around the awaits in `synchronizeSessionDocument` and
+	 * apply edits out of order.
+	 */
+	private enqueue(task: () => Promise<void>): Promise<void> {
+		const result = this.taskQueue.then(task);
+		this.taskQueue = result.then(undefined, () => undefined);
+		return result;
+	}
+
 	private showSessionExitStats(session: BusySession, reason: SessionExitReason): void {
-		const charsTyped = this.countTypedSessionCharacters(session);
 		const reasonLabel = getSessionExitLabel(reason);
+		const charsTyped = session.state.typedCharacters;
 
 		if (charsTyped === 0) {
 			void vscode.window.showInformationMessage(`Session ${reasonLabel} | No typing recorded`);
 			return;
 		}
 
-		const activeElapsedMs = this.calculateSessionActiveElapsed(session);
-		const stats = calculateStats(charsTyped, activeElapsedMs, {
-			totalKeystrokes: session.totalKeystrokes,
-			errors: session.errorKeystrokes,
-			backspaces: session.backspaceCount,
-			minElapsedMs: 1500,
+		const stats = calculateStats(charsTyped, session.state.activeElapsedMs, {
+			totalKeystrokes: session.state.totalKeystrokes,
+			errors: session.state.errorKeystrokes,
+			backspaces: session.state.backspaceCount,
+			minElapsedMs: MIN_ELAPSED_MS,
 		});
 
 		const message = [
@@ -798,71 +848,32 @@ export class LookBusyController implements vscode.Disposable {
 
 		void vscode.window.showInformationMessage(message);
 	}
+
+	private runSafely(task: Promise<void>): void {
+		void task.catch((error) => {
+			reportFailure('run a Look Busy session task', error);
+		});
+	}
 }
 
-function buildLineStarts(text: string): number[] {
-	const starts = [0];
+function getDocumentEndPosition(document: vscode.TextDocument): vscode.Position {
+	const lastLineIndex = Math.max(0, document.lineCount - 1);
+	return document.lineAt(lastLineIndex).range.end;
+}
 
-	for (let i = 0; i < text.length; i += 1) {
-		if (text[i] === '\n') {
-			starts.push(i + 1);
+function extractCompositionText(args: unknown): string {
+	if (typeof args === 'object' && args !== null && 'text' in args) {
+		const text = (args as { text: unknown }).text;
+		if (typeof text === 'string') {
+			return text;
 		}
 	}
 
-	if (starts[starts.length - 1] !== text.length) {
-		starts.push(text.length);
-	}
-
-	return starts;
+	return '';
 }
 
-function findLineForIndex(index: number, lineStarts: number[]): number {
-	let low = 0;
-	let high = lineStarts.length - 1;
-
-	while (low < high) {
-		const mid = Math.floor((low + high + 1) / 2);
-		if (lineStarts[mid] <= index) {
-			low = mid;
-		} else {
-			high = mid - 1;
-		}
-	}
-
-	return Math.max(0, Math.min(low, lineStarts.length - 2));
-}
-
-function buildMaskedTargetText(target: string, visibleEnd: number): string {
-	if (visibleEnd >= target.length) {
-		return target;
-	}
-
-	return target.slice(0, visibleEnd);
-}
-
-export function getTabEquivalentIndentationLength(target: string, index: number, typingEnd: number): number {
-	if (index < 0 || index >= typingEnd || target[index] === '\n') {
-		return 0;
-	}
-
-	const lineStart = target.lastIndexOf('\n', index - 1) + 1;
-	for (let i = lineStart; i < index; i += 1) {
-		const previousCharacter = target[i];
-		if (previousCharacter !== ' ' && previousCharacter !== '\t') {
-			return 0;
-		}
-	}
-
-	let consumed = 0;
-	while (index + consumed < typingEnd && consumed < 4) {
-		const expectedCharacter = target[index + consumed];
-		if (expectedCharacter !== ' ' && expectedCharacter !== '\t') {
-			break;
-		}
-		consumed += 1;
-	}
-
-	return consumed;
+function reportFailure(action: string, error: unknown): void {
+	console.error(`Look Busy: failed to ${action}.`, error);
 }
 
 function getSessionExitLabel(reason: SessionExitReason): string {
@@ -876,8 +887,6 @@ function getSessionExitLabel(reason: SessionExitReason): string {
 		case 'restarted':
 			return 'restarted';
 		case 'disposed':
-			return 'ended';
-		default:
 			return 'ended';
 	}
 }

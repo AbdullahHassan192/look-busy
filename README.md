@@ -4,7 +4,7 @@ Terrified your boss will replace you with an agent if they catch you scrolling r
 
 **Look Busy** launches a Monkeytype-style typing session directly inside your editor using real code from your current project. So you can hand off a task to Claude, Copilot, or Antigravity, trigger Look Busy, and look intensely productive until the prompt finishes.
 
-![Look Busy demo](media/demo.gif)
+![Look Busy demo](https://raw.githubusercontent.com/AbdullahHassan192/look-busy/master/media/demo.gif)
 
 ## How it works
 

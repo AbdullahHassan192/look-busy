@@ -14,3 +14,6 @@ vsc-extension-quickstart.md
 **/*.ts
 **/.vscode-test.*
 *.vsix
+
+# Kept in the repo so the README can link to it on GitHub, but never packaged.
+media/demo.gif
